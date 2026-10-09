@@ -187,7 +187,9 @@ export default function Connectivity() {
   useEffect(() => {
     if (!profileId && profiles?.length) setProfileId(status?.profileId ?? profiles[0]!.id);
   }, [profiles, profileId, status]);
-  useEffect(() => logRef.current?.scrollTo({ top: logRef.current.scrollHeight }), [logs]);
+  useEffect(() => {
+    logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
+  }, [logs]);
 
   useTopic<VpnStatus>("vpn.status", setStatus);
   useTopic<{ ts: number; line: string }>("vpn.log", (l) => setLogs((all) => [...all.slice(-300), l]));
