@@ -159,11 +159,8 @@ export class ExacqSource implements VideoSource {
   }
 
   private async fetchRaw(url: string, init: RequestInit = {}, timeout = TIMEOUT_MS) {
-    const t0 = Date.now();
     try {
-      const res = await fetch(url, { ...init, signal: init.signal ?? AbortSignal.timeout(timeout), redirect: "manual" });
-      this.markOk(Date.now() - t0);
-      return res;
+      return await fetch(url, { ...init, signal: init.signal ?? AbortSignal.timeout(timeout), redirect: "manual" });
     } catch (err) {
       const e = new ExacqError(`No se pudo contactar ${this.cfg.baseUrl}: ${(err as Error).message}. ¿VPN conectada?`, "network");
       this.markError(e);
@@ -174,6 +171,7 @@ export class ExacqSource implements VideoSource {
   async login(): Promise<string> {
     if (this.loggingIn) return this.loggingIn;
     this.loggingIn = (async () => {
+      const t0 = Date.now();
       const cred = this.credentials();
       if (!cred) throw new ExacqError(`El servidor ${this.cfg.name} no tiene credenciales asignadas en la bóveda`, "auth");
       const body = new URLSearchParams({ u: cred.username, p: cred.password, responseVersion: "2", s: "0" });
@@ -189,16 +187,19 @@ export class ExacqSource implements VideoSource {
       } catch {
         throw new ExacqError("El login no devolvió JSON: ¿la URL apunta al exacqVision Web Service?", "protocol");
       }
-      if (!json.sessionId) {
-        const e = new ExacqError("Credenciales de exacqVision rechazadas", "auth");
-        this.markError(e);
-        throw e;
+      if (!json?.sessionId || json.success === false) {
+        throw new ExacqError("Credenciales de exacqVision rechazadas", "auth");
       }
       this.session = json.sessionId;
+      this.markOk(Date.now() - t0);
       return json.sessionId;
     })();
     try {
       return await this.loggingIn;
+    } catch (err) {
+      this.session = null;
+      this.markError(err);
+      throw err;
     } finally {
       this.loggingIn = null;
     }
@@ -209,35 +210,49 @@ export class ExacqSource implements VideoSource {
   }
 
   /** GET JSON con re-login automático si la sesión expiró. */
-  private async getJson(path: string, params: Record<string, string>, retry = true): Promise<unknown> {
-    const s = await this.sessionId();
-    const qs = new URLSearchParams({ ...params, s });
-    const res = await this.fetchRaw(this.url(`${path}?${qs}`));
-    if (res.status === 401 || res.status === 403) {
-      this.session = null;
-      if (retry) return this.getJson(path, params, false);
-      throw new ExacqError("Sesión de exacqVision rechazada", "auth");
-    }
-    if (!res.ok) throw new ExacqError(`${path} → HTTP ${res.status}`);
-    const text = await res.text();
-    let json: unknown;
+  private async getJson(path: string, params: Record<string, string>, retry = true, validate?: (json: unknown) => void): Promise<unknown> {
+    const t0 = Date.now();
     try {
-      json = JSON.parse(text);
-    } catch {
-      this.session = null;
-      if (retry) return this.getJson(path, params, false);
-      throw new ExacqError(`${path} devolvió una respuesta no JSON`);
+      const s = await this.sessionId();
+      const qs = new URLSearchParams({ ...params, s });
+      const res = await this.fetchRaw(this.url(`${path}?${qs}`));
+      if (res.status === 401 || res.status === 403) {
+        this.session = null;
+        if (retry) return await this.getJson(path, params, false, validate);
+        throw new ExacqError("Sesión de exacqVision rechazada", "auth");
+      }
+      if (!res.ok) throw new ExacqError(`${path} → HTTP ${res.status}`);
+      const text = await res.text();
+      let json: unknown;
+      try {
+        json = JSON.parse(text);
+      } catch {
+        this.session = null;
+        if (retry) return await this.getJson(path, params, false, validate);
+        throw new ExacqError(`${path} devolvió una respuesta no JSON`);
+      }
+      if ((json as { success?: boolean })?.success === false) {
+        this.session = null;
+        if (retry) return await this.getJson(path, params, false, validate);
+        throw new ExacqError(`${path} devolvió success=false`, "auth");
+      }
+      validate?.(json);
+      this.markOk(Date.now() - t0);
+      return json;
+    } catch (err) {
+      this.markError(err);
+      throw err;
     }
-    if ((json as { success?: boolean })?.success === false) {
-      this.session = null;
-      if (retry) return this.getJson(path, params, false);
-      throw new ExacqError(`${path} devolvió success=false`, "auth");
-    }
-    return json;
   }
 
   async listCameras() {
-    return parseCameraList(await this.getJson("v1/config.web", { output: "json" }));
+    const json = await this.getJson("v1/config.web", { output: "json" }, true, (config) => {
+      const root = config as Record<string, unknown> | null;
+      if (!Array.isArray(root?.Cameras ?? root?.cameras)) {
+        throw new ExacqError("v1/config.web no contiene un array Cameras/cameras compatible: revise el JSON del servidor", "protocol");
+      }
+    });
+    return parseCameraList(json);
   }
 
   /** Devuelve el JSON crudo de config.web (útil para diagnosticar nombres de campos de su versión). */
