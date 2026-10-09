@@ -286,7 +286,7 @@ export class ExacqSource implements VideoSource {
     throw new ExacqError("No se obtuvo imagen: revise la plantilla de snapshot del servidor", "protocol");
   }
 
-  async liveStream(cameraId: string): Promise<LiveStream | null> {
+  async liveStream(cameraId: string): Promise<(LiveStream & { body: Readable }) | null> {
     if (!this.cfg.liveTemplate) return null;
     const s = await this.sessionId();
     const ac = new AbortController();
@@ -363,7 +363,11 @@ export class ExacqSource implements VideoSource {
       try {
         const live = await this.liveStream(cameraId);
         if (live) {
+          // La prueba sólo inspecciona las cabeceras y cancela el cuerpo.
+          // fromWeb emite AbortError al cancelar: no hay un consumidor que lo maneje.
+          live.body.on("error", () => undefined);
           live.abort();
+          live.body.destroy();
           result.live = tpl;
           result.tried.push({ template: tpl, result: "OK (multipart)" });
           break;

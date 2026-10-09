@@ -3,6 +3,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import { useToast } from "../components/toasts";
 import { Empty, ErrorNote, Field, Modal, PageHeader, Panel, Spinner } from "../components/ui";
 import { api, ApiError } from "../lib/api";
+import { useAuth } from "../lib/auth";
 import { fmtAgo } from "../lib/format";
 import { useApi } from "../lib/hooks";
 import type { VaultEntry } from "../lib/types";
@@ -110,6 +111,8 @@ function EntryModal({ entry, open, onClose, onSaved }: { entry: VaultEntry | nul
 }
 
 export default function Vault() {
+  const { can } = useAuth();
+  const canAdmin = can("admin");
   const toast = useToast();
   const { data, loading, reload } = useApi<VaultEntry[]>("/api/vault");
   const [editing, setEditing] = useState<VaultEntry | null>(null);
@@ -132,7 +135,7 @@ export default function Vault() {
         title="Bóveda de credenciales"
         subtitle="Accesos a FortiVPN, exacqVision e IA guardados cifrados para no tener que tipearlos cada vez"
         icon={<KeyRound size={20} />}
-        actions={
+        actions={canAdmin && (
           <button
             className="btn btn-primary btn-sm"
             onClick={() => {
@@ -142,8 +145,9 @@ export default function Vault() {
           >
             <Plus size={14} /> Nueva credencial
           </button>
-        }
+        )}
       />
+      {!canAdmin && <div className="text-xs text-ink-2 rounded-lg border border-line bg-panel px-3 py-2">Acceso Tester: nombres, referencias y estado de las credenciales. Los secretos sólo están disponibles para un administrador autorizado.</div>}
 
       <div className="grid grid-cols-1 xl:grid-cols-4 gap-4">
         <Panel title="Protección" icon={<Lock size={16} />} glow bodyClass="p-4 space-y-2 text-sm text-ink-2">
@@ -168,7 +172,7 @@ export default function Vault() {
                         <div className="font-semibold truncate">{e.name}</div>
                         <div className="text-[11px] text-muted">{k.label}</div>
                       </div>
-                      <button
+                      {canAdmin && <><button
                         className="btn btn-ghost btn-sm"
                         onClick={() => {
                           setEditing(e);
@@ -192,6 +196,7 @@ export default function Vault() {
                       >
                         <Trash2 size={14} />
                       </button>
+                      </>}
                     </div>
                     <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
                       <div>
@@ -218,14 +223,14 @@ export default function Vault() {
             </div>
           ) : (
             <Empty icon={<KeyRound size={28} />} title="La bóveda está vacía">
-              Cargue el usuario del SSL-VPN de FortiGate, el usuario de exacqVision y la API key de Anthropic.
+              {canAdmin ? "Cargue el usuario del SSL-VPN de FortiGate, el usuario de exacqVision y la API key de Anthropic." : "Un administrador debe cargar las credenciales de FortiVPN, exacqVision e IA."}
             </Empty>
           )}
         </Panel>
       </div>
 
-      <EntryModal entry={editing} open={open} onClose={() => setOpen(false)} onSaved={() => void reload()} />
-      <Modal open={Boolean(revealed)} onClose={() => setRevealed(null)} title={`Secreto · ${revealed?.name ?? ""}`} width={460}>
+      {canAdmin && <EntryModal entry={editing} open={open} onClose={() => setOpen(false)} onSaved={() => void reload()} />}
+      <Modal open={canAdmin && Boolean(revealed)} onClose={() => setRevealed(null)} title={`Secreto · ${revealed?.name ?? ""}`} width={460}>
         <p className="text-xs text-warn mb-3">Visible por 30 segundos. Esta acción quedó registrada en la auditoría.</p>
         <pre className="font-mono text-sm bg-bg p-3 rounded-lg border border-line overflow-x-auto select-all">{JSON.stringify(revealed?.secret, null, 2)}</pre>
       </Modal>

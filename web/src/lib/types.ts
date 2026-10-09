@@ -1,4 +1,4 @@
-export type Role = "admin" | "operator" | "viewer";
+export type Role = "admin" | "operator" | "viewer" | "tester";
 export type Severity = "info" | "low" | "medium" | "high" | "critical";
 export type EventStatus = "new" | "ack" | "investigating" | "resolved" | "false_positive";
 

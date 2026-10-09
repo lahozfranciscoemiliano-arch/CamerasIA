@@ -17,7 +17,7 @@ Un centro de monitoreo con credenciales de VPN y acceso a cámaras es un **objet
 | Credenciales VPN en disco / procesos | Archivo temporal 0600 en directorio privado, sobrescrito y borrado al instante; nunca en argumentos; enmascarado en logs. |
 | Inyección en la configuración VPN | Sólo claves conocidas; se rechazan saltos de línea en usuario/contraseña/OTP; host validado. |
 | SSRF vía plantillas de video | Las plantillas sólo pueden ser rutas (`/…`); el host siempre es el del servidor configurado por un admin. |
-| Escalamiento de privilegios | Roles jerárquicos verificados en el servidor en cada endpoint; no se puede quitar el último admin activo. |
+| Escalamiento de privilegios | Roles verificados en el servidor en cada endpoint; Tester tiene consultas y diagnósticos, y no se puede quitar el último admin activo. |
 | Manipulación de evidencia | Bitácora encadenada con SHA-256 (cada registro incluye el hash del anterior); verificación desde la UI. |
 | Integraciones externas | API keys de ingesta con prefijo + hash SHA-256 (se muestran una sola vez), revocables, límite de tamaño y de tasa. |
 | Prompt injection por imágenes | Las instrucciones de la IA tratan todo texto en imágenes/eventos como dato; el asistente sólo tiene herramientas de **lectura**. |
@@ -31,6 +31,16 @@ Un centro de monitoreo con credenciales de VPN y acceso a cámaras es un **objet
 5. **Contenedor**: el modo VPN requiere `NET_ADMIN` y `/dev/ppp`, y openfortivpn corre como root dentro del contenedor. Mantenga el contenedor aislado, actualizado y sin montar el socket de Docker.
 6. **Actualizaciones**: `npm audit` / reconstruir la imagen periódicamente; mantener exacqVision Web Service y FortiOS al día.
 7. **Revisión**: controle *Auditoría* (intentos fallidos, revelado de secretos, cambios de VPN) y verifique la integridad de la cadena.
+
+## Cuenta Tester (ChatGPT)
+
+Un administrador puede crear o asignar el rol **Tester (ChatGPT)** desde **Administración → Usuarios**. Está pensado para revisar cámaras, eventos, conectividad, servidores exacq, configuración, metadatos de la bóveda y auditoría. Puede ejecutar **Probar**, **Detectar video** y consultar el JSON de configuración de los servidores exacq habilitados; estas pruebas usan las credenciales almacenadas en el backend y pueden actualizar el estado y el inventario descubierto.
+
+El JSON diagnóstico para Tester contiene los campos de identificación y estado de cámaras y la estructura tipada de la configuración; los demás valores no se devuelven. El Administrador conserva el JSON original.
+
+Tester no puede modificar usuarios, configuración ni credenciales, revelar secretos, conectar o desconectar la VPN, gestionar eventos ni ejecutar análisis IA. El cambio de contraseña inicial y el alta TOTP siguen el flujo normal; **2FA es obligatorio para Tester incluso si `REQUIRE_2FA=false`**. Al confirmar el alta TOTP se cierran las otras sesiones abiertas antes de verificar ese segundo factor. No hay cuentas precreadas ni acceso especial sin autenticación. Para una revisión temporal, deshabilite la cuenta al terminar.
+
+Las actualizaciones migran el esquema SQLite para admitir este rol conservando los usuarios y sus sesiones, contraseñas y datos de 2FA. La migración se ejecuta automáticamente al iniciar la aplicación; mantenga el respaldo habitual antes de actualizar.
 
 ## Privacidad
 

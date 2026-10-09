@@ -35,11 +35,18 @@ export function clearSessionCookie(reply: FastifyReply, cfg: AppConfig) {
   reply.clearCookie(sessionCookieName(cfg), { path: "/", secure: cfg.cookieSecure, sameSite: "strict", httpOnly: true });
 }
 
-const RANK: Record<Role, number> = { viewer: 1, operator: 2, admin: 3 };
+const RANK: Record<Role, number> = { viewer: 1, tester: 1, operator: 2, admin: 3 };
+
+const hasRole = (actual: Role, required: Role) => {
+  if (required === "tester") return actual === "tester" || actual === "admin";
+  return (RANK[actual] ?? 0) >= (RANK[required] ?? Infinity);
+};
 
 export interface GuardOptions {
-  /** Rol mínimo requerido (jerárquico: admin > operator > viewer). */
+  /** Rol mínimo; tester permite diagnósticos a Tester y Administrador. */
   role?: Role;
+  /** Admite también Tester en consultas que ya permiten Operador. */
+  allowTester?: boolean;
   /** Exige re-autenticación 2FA reciente (acciones sensibles). */
   stepUp?: boolean;
   /** Permite el acceso aunque la sesión tenga pendiente el cambio de clave o el alta de 2FA. */
@@ -57,7 +64,7 @@ export function makeGuard(auth: AuthService, cfg: AppConfig) {
       if (r.mustChangePassword) throw new HttpError(403, "Debe cambiar su contraseña", "must_change_password");
       if (r.mustEnrollTotp) throw new HttpError(403, "Debe activar la verificación en dos pasos (2FA)", "must_enroll_totp");
     }
-    if (opts.role && RANK[ctx.user.role] < RANK[opts.role]) {
+    if (opts.role && !hasRole(ctx.user.role, opts.role) && !(opts.allowTester && ctx.user.role === "tester")) {
       throw new HttpError(403, "Permisos insuficientes", "forbidden");
     }
     if (opts.stepUp && !auth.hasRecentStepUp(ctx)) {

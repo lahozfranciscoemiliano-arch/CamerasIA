@@ -66,7 +66,7 @@ export function registerAiRoutes(app: FastifyInstance, ctx: AppCtx) {
   });
 
   app.get<{ Querystring: { days?: string } }>("/api/ai/usage", async (req) => {
-    guard(req, { role: "operator" });
+    guard(req, { role: "operator", allowTester: true });
     return ai.usageSummary(Math.min(Math.max(Number(req.query.days ?? 7), 1), 90));
   });
 

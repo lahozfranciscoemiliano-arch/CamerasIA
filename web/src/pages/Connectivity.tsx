@@ -164,11 +164,12 @@ function HostRow({ h, canAdmin, onDelete }: { h: Host; canAdmin: boolean; onDele
 
 export default function Connectivity() {
   const { can } = useAuth();
+  const canReviewVpn = can("operator") || can("tester");
   const toast = useToast();
   const now = useNow();
   const { data: status, setData: setStatus } = useApi<VpnStatus>("/api/vpn/status");
-  const { data: profiles, reload: reloadProfiles } = useApi<VpnProfile[]>(can("operator") ? "/api/vpn/profiles" : null);
-  const { data: logsInit } = useApi<Array<{ ts: number; line: string }>>(can("operator") ? "/api/vpn/logs" : null);
+  const { data: profiles, reload: reloadProfiles } = useApi<VpnProfile[]>(canReviewVpn ? "/api/vpn/profiles" : null);
+  const { data: logsInit } = useApi<Array<{ ts: number; line: string }>>(canReviewVpn ? "/api/vpn/logs" : null);
   const { data: sources } = useApi<SourceStatus[]>("/api/exacq/status", { interval: 15_000 });
   const { data: hosts, setData: setHosts, reload: reloadHosts } = useApi<Host[]>("/api/health/hosts");
   const [logs, setLogs] = useState<Array<{ ts: number; line: string }>>([]);
@@ -307,7 +308,7 @@ export default function Connectivity() {
               </Empty>
             )
           ) : (
-            <div className="text-xs text-muted">Su rol sólo permite ver el estado del túnel.</div>
+            <div className="text-xs text-muted">{can("tester") ? "Acceso Tester: consulta del estado, perfiles y registros del túnel." : "Su rol sólo permite ver el estado del túnel."}</div>
           )}
           {(error || (st === "error" && status?.error)) && <ErrorNote>{error || status?.error}</ErrorNote>}
         </Panel>
@@ -326,11 +327,11 @@ export default function Connectivity() {
         </Panel>
       </div>
 
-      {can("admin") && (
+      {can("tester") && (
         <Panel
           title="Perfiles VPN"
           icon={<ShieldCheck size={16} />}
-          actions={
+          actions={can("admin") && (
             <button
               className="btn btn-sm"
               onClick={() => {
@@ -340,7 +341,7 @@ export default function Connectivity() {
             >
               <Plus size={14} /> Nuevo perfil
             </button>
-          }
+          )}
         >
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
@@ -365,6 +366,7 @@ export default function Connectivity() {
                     <td className="pr-3">{p.autoConnect ? "Sí" : "No"}</td>
                     <td className="pr-3 text-xs text-ink-2">{p.trustedCerts.length} huella(s)</td>
                     <td className="text-right whitespace-nowrap">
+                      {can("admin") && <>
                       <button
                         className="btn btn-ghost btn-sm"
                         onClick={() => {
@@ -388,12 +390,13 @@ export default function Connectivity() {
                       >
                         <Trash2 size={14} />
                       </button>
+                      </>}
                     </td>
                   </tr>
                 ))}
               </tbody>
             </table>
-            {!profiles?.length && <div className="text-sm text-muted py-3">Todavía no hay perfiles. Cree uno con el gateway del FortiGate y una credencial de la bóveda.</div>}
+            {!profiles?.length && <div className="text-sm text-muted py-3">{can("admin") ? "Todavía no hay perfiles. Cree uno con el gateway del FortiGate y una credencial de la bóveda." : "Todavía no hay perfiles VPN configurados."}</div>}
           </div>
         </Panel>
       )}
@@ -470,7 +473,7 @@ export default function Connectivity() {
         </Panel>
       </div>
 
-      <ProfileModal profile={editing} open={modalOpen} onClose={() => setModalOpen(false)} onSaved={() => void reloadProfiles()} />
+      <ProfileModal profile={editing} open={can("admin") && modalOpen} onClose={() => setModalOpen(false)} onSaved={() => void reloadProfiles()} />
     </div>
   );
 }

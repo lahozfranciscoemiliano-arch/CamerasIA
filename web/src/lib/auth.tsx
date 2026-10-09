@@ -12,7 +12,7 @@ interface AuthCtx {
 }
 
 const Ctx = createContext<AuthCtx>(null!);
-const RANK: Record<Role, number> = { viewer: 1, operator: 2, admin: 3 };
+const RANK: Record<Role, number> = { viewer: 1, tester: 1, operator: 2, admin: 3 };
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [me, setMe] = useState<Me | null>(null);
@@ -39,7 +39,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setMe(null);
   }, []);
 
-  const can = useCallback((role: Role) => Boolean(me && RANK[me.user.role] >= RANK[role]), [me]);
+  const can = useCallback((role: Role) => {
+    if (!me) return false;
+    if (role === "tester") return me.user.role === "tester" || me.user.role === "admin";
+    return (RANK[me.user.role] ?? 0) >= (RANK[role] ?? Infinity);
+  }, [me]);
 
   return <Ctx.Provider value={{ me, loading, refresh, setMe, logout, can }}>{children}</Ctx.Provider>;
 }

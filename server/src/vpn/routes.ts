@@ -30,12 +30,12 @@ export function registerVpnRoutes(app: FastifyInstance, ctx: AppCtx) {
   });
 
   app.get("/api/vpn/logs", async (req) => {
-    guard(req, { role: "operator" });
+    guard(req, { role: "operator", allowTester: true });
     return vpn.logs();
   });
 
   app.get("/api/vpn/profiles", async (req) => {
-    guard(req, { role: "operator" });
+    guard(req, { role: "operator", allowTester: true });
     return vpn.profiles().map(publicProfile);
   });
 

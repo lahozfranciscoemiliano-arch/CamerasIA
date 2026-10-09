@@ -108,8 +108,8 @@ export default function Layout() {
     { to: "/eventos", label: "Eventos", icon: <Siren size={18} />, badge: openCount },
     { to: "/ia", label: "Asistente IA", icon: <Bot size={18} />, min: "operator" as const },
     { to: "/conectividad", label: "Conectividad", icon: <Network size={18} /> },
-    { to: "/boveda", label: "Bóveda", icon: <KeyRound size={18} />, min: "admin" as const },
-    { to: "/admin", label: "Administración", icon: <Settings size={18} />, min: "admin" as const },
+    { to: "/boveda", label: "Bóveda", icon: <KeyRound size={18} />, min: "tester" as const },
+    { to: "/admin", label: "Administración", icon: <Settings size={18} />, min: "tester" as const },
   ].filter((n) => !n.min || can(n.min));
 
   const tColor = threat ? THREAT_COLORS[threat.level] : "var(--color-muted)";

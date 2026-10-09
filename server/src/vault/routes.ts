@@ -22,7 +22,7 @@ export function registerVaultRoutes(app: FastifyInstance, ctx: AppCtx) {
   const { guard, vault, audit, cfg } = ctx;
 
   app.get("/api/vault", async (req) => {
-    guard(req, { role: "admin" });
+    guard(req, { role: "tester" });
     return vault.list();
   });
 

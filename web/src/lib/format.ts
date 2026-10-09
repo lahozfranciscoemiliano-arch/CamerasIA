@@ -87,4 +87,4 @@ export const TYPE_LABEL: Record<string, string> = {
   system: "Sistema",
 };
 
-export const ROLE_LABEL = { admin: "Administrador", operator: "Operador", viewer: "Observador" } as const;
+export const ROLE_LABEL = { admin: "Administrador", operator: "Operador", viewer: "Observador", tester: "Tester (ChatGPT)" } as const;

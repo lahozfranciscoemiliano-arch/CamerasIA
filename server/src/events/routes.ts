@@ -159,7 +159,7 @@ export function registerEventRoutes(app: FastifyInstance, ctx: AppCtx) {
   });
 
   app.get("/api/ingest/keys", async (req) => {
-    guard(req, { role: "admin" });
+    guard(req, { role: "tester" });
     return db.all("SELECT id, name, prefix, created_at AS createdAt, last_used_at AS lastUsedAt, revoked FROM ingest_keys ORDER BY created_at DESC");
   });
 

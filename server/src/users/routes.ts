@@ -5,7 +5,7 @@ import { HttpError, clientIp } from "../http/guards.js";
 import { checkPasswordPolicy } from "../security/passwords.js";
 import { publicUser, type UserRow } from "../auth/service.js";
 
-const RoleEnum = z.enum(["admin", "operator", "viewer"]);
+const RoleEnum = z.enum(["admin", "operator", "viewer", "tester"]);
 const CreateBody = z.object({
   username: z.string().regex(/^[a-zA-Z0-9._-]{3,32}$/, "Usuario: 3-32 caracteres alfanuméricos, punto, guion o guion bajo"),
   displayName: z.string().max(80).optional(),
@@ -26,7 +26,7 @@ export function registerUserRoutes(app: FastifyInstance, ctx: AppCtx) {
   };
 
   app.get("/api/users", async (req) => {
-    guard(req, { role: "admin" });
+    guard(req, { role: "tester" });
     return db.all<UserRow>("SELECT * FROM users ORDER BY username").map(publicUser);
   });
 
@@ -85,7 +85,7 @@ export function registerUserRoutes(app: FastifyInstance, ctx: AppCtx) {
 
   // ───────── Auditoría ─────────
   app.get<{ Querystring: { limit?: string; before?: string; action?: string; username?: string } }>("/api/audit", async (req) => {
-    guard(req, { role: "admin" });
+    guard(req, { role: "tester" });
     const q = req.query;
     return audit.list({
       limit: q.limit ? Number(q.limit) : undefined,
@@ -96,7 +96,7 @@ export function registerUserRoutes(app: FastifyInstance, ctx: AppCtx) {
   });
 
   app.get("/api/audit/verify", async (req) => {
-    guard(req, { role: "admin" });
+    guard(req, { role: "tester" });
     return audit.verify();
   });
 }

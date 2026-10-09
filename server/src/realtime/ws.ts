@@ -4,7 +4,7 @@ import type { AppCtx } from "../context.js";
 import { sessionCookieName } from "../http/guards.js";
 import type { RealtimeMessage } from "./bus.js";
 
-const OPERATOR_TOPICS = new Set(["vpn.log"]);
+const VPN_LOG_ROLES = new Set(["admin", "operator", "tester"]);
 
 /** Canal WebSocket autenticado por cookie de sesión: empuja eventos, estado de VPN, cámaras y salud en tiempo real. */
 export function registerRealtime(app: FastifyInstance, ctx: AppCtx) {
@@ -13,7 +13,7 @@ export function registerRealtime(app: FastifyInstance, ctx: AppCtx) {
   ctx.bus.on("message", (msg: RealtimeMessage) => {
     const payload = JSON.stringify(msg);
     for (const [socket, info] of clients) {
-      if (OPERATOR_TOPICS.has(msg.topic) && info.role === "viewer") continue;
+      if (msg.topic === "vpn.log" && !VPN_LOG_ROLES.has(info.role)) continue;
       if (socket.readyState === socket.OPEN) socket.send(payload);
     }
   });
@@ -23,6 +23,7 @@ export function registerRealtime(app: FastifyInstance, ctx: AppCtx) {
     for (const [socket, info] of clients) {
       const a = ctx.auth.resolveSession(info.token);
       if (!a || ctx.auth.restrictions(a).mustEnrollTotp || ctx.auth.restrictions(a).mustChangePassword) socket.close(4401, "session");
+      else info.role = a.user.role;
     }
   }, 60_000).unref();
 

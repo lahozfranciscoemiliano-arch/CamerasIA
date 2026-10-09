@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import { useToast } from "../components/toasts";
 import { Dot, Empty, ErrorNote, Field, Modal, OkNote, PageHeader, Panel, Spinner, Tabs, Toggle } from "../components/ui";
 import { api, ApiError } from "../lib/api";
+import { useAuth } from "../lib/auth";
 import { fmtAgo, fmtDateTime, ROLE_LABEL } from "../lib/format";
 import { useApi } from "../lib/hooks";
 import type { AuditRow, Camera, ExacqServer, Role, User, VaultEntry, VpnProfile } from "../lib/types";
@@ -11,6 +12,8 @@ type Tab = "users" | "servers" | "cameras" | "ai" | "integrations" | "audit";
 
 // ───────────────────────── Usuarios ─────────────────────────
 function UsersTab() {
+  const { can } = useAuth();
+  const canAdmin = can("admin");
   const toast = useToast();
   const { data: users, reload } = useApi<User[]>("/api/users");
   const [open, setOpen] = useState(false);
@@ -29,14 +32,14 @@ function UsersTab() {
     <Panel
       title="Usuarios y roles"
       icon={<Users size={16} />}
-      actions={
+      actions={canAdmin && (
         <button className="btn btn-sm" onClick={() => (setForm({ username: "", displayName: "", role: "operator", password: "" }), setError(""), setOpen(true))}>
           <UserPlus size={14} /> Nuevo usuario
         </button>
-      }
+      )}
     >
       <div className="text-xs text-ink-2 mb-3">
-        <b>Administrador</b>: todo. <b>Operador</b>: video, eventos, IA y conectar VPN. <b>Observador</b>: sólo ver. Todos deben activar 2FA en el primer ingreso.
+        <b>Administrador</b>: todo. <b>Operador</b>: video, eventos, IA y conectar VPN. <b>Observador</b>: sólo ver. <b>Tester (ChatGPT)</b>: ver cámaras, consultar configuración y ejecutar diagnósticos de exacqVision. Todos deben activar 2FA en el primer ingreso.
       </div>
       <div className="overflow-x-auto">
         <table className="w-full text-sm">
@@ -58,13 +61,13 @@ function UsersTab() {
                   <div className="text-xs text-muted font-mono">{u.username}</div>
                 </td>
                 <td className="pr-3">
-                  <select className="input !py-1 !w-36" value={u.role} onChange={(e) => void run(() => api.patch(`/api/users/${u.id}`, { role: e.target.value }), "Rol actualizado")}>
-                    {(["admin", "operator", "viewer"] as Role[]).map((r) => (
+                  {canAdmin ? <select className="input !py-1 !w-44" value={u.role} onChange={(e) => void run(() => api.patch(`/api/users/${u.id}`, { role: e.target.value }), "Rol actualizado")}>
+                    {(["admin", "operator", "viewer", "tester"] as Role[]).map((r) => (
                       <option key={r} value={r}>
                         {ROLE_LABEL[r]}
                       </option>
                     ))}
-                  </select>
+                  </select> : ROLE_LABEL[u.role]}
                 </td>
                 <td className="pr-3">{u.totpEnabled ? <span className="text-ok flex items-center gap-1"><ShieldCheck size={14} /> Activo</span> : <span className="text-warn">Pendiente</span>}</td>
                 <td className="pr-3 text-xs text-ink-2">
@@ -75,6 +78,7 @@ function UsersTab() {
                   {u.disabled ? <span className="text-muted">Deshabilitado</span> : u.lockedUntil && u.lockedUntil > Date.now() ? <span className="text-crit">Bloqueado</span> : <span className="text-ok">Activo</span>}
                 </td>
                 <td className="text-right whitespace-nowrap space-x-1">
+                  {canAdmin && <>
                   {u.lockedUntil && u.lockedUntil > Date.now() && (
                     <button className="btn btn-ghost btn-sm" title="Desbloquear" onClick={() => void run(() => api.post(`/api/users/${u.id}/unlock`), "Usuario desbloqueado")}>
                       <Unlock size={14} />
@@ -96,6 +100,7 @@ function UsersTab() {
                   <button className="btn btn-ghost btn-sm" title={u.disabled ? "Habilitar" : "Deshabilitar"} onClick={() => void run(() => api.patch(`/api/users/${u.id}`, { disabled: !u.disabled }), u.disabled ? "Usuario habilitado" : "Usuario deshabilitado")}>
                     {u.disabled ? <CheckCircle2 size={14} className="text-ok" /> : <XCircle size={14} className="text-crit" />}
                   </button>
+                  </>}
                 </td>
               </tr>
             ))}
@@ -103,7 +108,7 @@ function UsersTab() {
         </table>
       </div>
       <Modal
-        open={open}
+        open={canAdmin && open}
         onClose={() => setOpen(false)}
         title="Nuevo usuario"
         footer={
@@ -139,7 +144,7 @@ function UsersTab() {
           </Field>
           <Field label="Rol">
             <select className="input" value={form.role} onChange={(e) => setForm({ ...form, role: e.target.value as Role })}>
-              {(["admin", "operator", "viewer"] as Role[]).map((r) => (
+              {(["admin", "operator", "viewer", "tester"] as Role[]).map((r) => (
                 <option key={r} value={r}>
                   {ROLE_LABEL[r]}
                 </option>
@@ -160,6 +165,8 @@ function UsersTab() {
 
 // ───────────────────────── Servidores exacqVision ─────────────────────────
 function ServersTab() {
+  const { can } = useAuth();
+  const canAdmin = can("admin");
   const toast = useToast();
   const { data: servers, reload } = useApi<ExacqServer[]>("/api/exacq/servers");
   const { data: vault } = useApi<VaultEntry[]>("/api/vault");
@@ -202,7 +209,7 @@ function ServersTab() {
     setBusy(`${id}:${kind}`);
     try {
       const r = kind === "raw" ? await api.get(`/api/exacq/servers/${id}/raw-config`) : await api.post(`/api/exacq/servers/${id}/${kind}`);
-      setResult({ title: kind === "test" ? "Prueba de conexión" : kind === "detect" ? "Detección de URLs de video" : "config.web (JSON crudo)", body: r });
+      setResult({ title: kind === "test" ? "Prueba de conexión" : kind === "detect" ? "Detección de URLs de video" : canAdmin ? "config.web (JSON crudo)" : "Diagnóstico de cámaras (config.web)", body: r });
       void reload();
     } catch (e) {
       toast({ tone: "error", title: (e as ApiError).message });
@@ -212,7 +219,7 @@ function ServersTab() {
   };
 
   return (
-    <Panel title="Servidores exacqVision" icon={<Server size={16} />} actions={<button className="btn btn-sm" onClick={() => edit(null)}><Plus size={14} /> Agregar servidor</button>}>
+    <Panel title="Servidores exacqVision" icon={<Server size={16} />} actions={canAdmin && <button className="btn btn-sm" onClick={() => edit(null)}><Plus size={14} /> Agregar servidor</button>}>
       <div className="text-xs text-ink-2 mb-3">
         Se usa la API HTTP del <b>exacqVision Web Service</b> (login.web, config.web, search.web, export.web). Si el servidor está en la red interna y este centro corre fuera de ella, asocie un perfil
         FortiVPN y conéctelo en <i>Conectividad</i>.
@@ -226,6 +233,13 @@ function ServersTab() {
                 <div className="font-semibold">{s.name}</div>
                 <div className="text-xs font-mono text-ink-2">{s.baseUrl}</div>
                 <div className="text-xs text-muted">{s.lastError ? `Error: ${s.lastError}` : s.lastOkAt ? `OK ${fmtAgo(s.lastOkAt)}` : "Sin contacto todavía"}</div>
+                {!canAdmin && <div className="mt-2 text-xs text-ink-2 space-y-1">
+                  <div>Estado: {s.enabled ? "Habilitado" : "Deshabilitado"} · Zona horaria: {s.timezone ?? "Predeterminada"}</div>
+                  <div>VPN: {s.vpnProfileId ? profiles?.find((p) => p.id === s.vpnProfileId)?.name ?? s.vpnProfileId : "Acceso directo"}</div>
+                  <div>Credencial: {s.credentialId ? vault?.find((v) => v.id === s.credentialId)?.name ?? s.credentialId : "Sin credencial"}</div>
+                  <div className="break-all">Snapshot: {s.snapshotTemplate ?? "Predeterminado"}</div>
+                  <div className="break-all">Stream: {s.liveTemplate ?? "Predeterminado"}</div>
+                </div>}
               </div>
               <button className="btn btn-sm" disabled={busy !== null} onClick={() => void action(s.id, "test")}>
                 {busy === `${s.id}:test` ? <Spinner size={13} /> : <Plug size={13} />} Probar
@@ -236,23 +250,24 @@ function ServersTab() {
               <button className="btn btn-sm" disabled={busy !== null} onClick={() => void action(s.id, "raw")}>
                 JSON
               </button>
-              <button className="btn btn-ghost btn-sm" onClick={() => edit(s)}>
+              {canAdmin && <><button className="btn btn-ghost btn-sm" onClick={() => edit(s)}>
                 <Edit3 size={14} />
               </button>
               <button className="btn btn-ghost btn-sm text-muted hover:text-crit" onClick={async () => confirm(`¿Eliminar ${s.name}?`) && (await api.del(`/api/exacq/servers/${s.id}`), void reload())}>
                 <Trash2 size={14} />
               </button>
+              </>}
             </div>
           ))}
         </div>
       ) : (
         <Empty icon={<Server size={28} />} title="Sin servidores configurados">
-          Agregue su servidor (p. ej. http://192.168.109.58) y una credencial de exacqVision de la bóveda.
+          {canAdmin ? "Agregue su servidor (p. ej. http://192.168.109.58) y una credencial de exacqVision de la bóveda." : "Un administrador debe agregar el servidor de exacqVision y su credencial."}
         </Empty>
       )}
 
       <Modal
-        open={open}
+        open={canAdmin && open}
         onClose={() => setOpen(false)}
         title={editing ? `Editar ${editing.name}` : "Agregar servidor exacqVision"}
         width={680}
@@ -326,6 +341,8 @@ function ServersTab() {
 
 // ───────────────────────── Cámaras ─────────────────────────
 function CamerasTab() {
+  const { can } = useAuth();
+  const canAdmin = can("admin");
   const toast = useToast();
   const { data: cams, setData } = useApi<Camera[]>("/api/cameras");
   const patch = async (c: Camera, body: Record<string, unknown>) => {
@@ -360,24 +377,24 @@ function CamerasTab() {
                 <td className="py-2 pr-3">
                   <span className="flex items-center gap-2">
                     <Dot tone={c.online ? "ok" : "crit"} />
-                    <input className="input !py-1 !w-48" defaultValue={c.name} onBlur={(e) => e.target.value !== c.name && void patch(c, { name: e.target.value })} />
+                    <input className="input !py-1 !w-48" readOnly={!canAdmin} defaultValue={c.name} onBlur={(e) => canAdmin && e.target.value !== c.name && void patch(c, { name: e.target.value })} />
                   </span>
                 </td>
                 <td className="pr-3">
-                  <input className="input !py-1 !w-36" defaultValue={c.zone ?? ""} placeholder="Perímetro, Depósito…" onBlur={(e) => e.target.value !== (c.zone ?? "") && void patch(c, { zone: e.target.value || null })} />
+                  <input className="input !py-1 !w-36" readOnly={!canAdmin} defaultValue={c.zone ?? ""} placeholder="Perímetro, Depósito…" onBlur={(e) => canAdmin && e.target.value !== (c.zone ?? "") && void patch(c, { zone: e.target.value || null })} />
                 </td>
                 <td className="pr-3 text-xs text-ink-2">{c.serverName}</td>
                 <td className="pr-3">
-                  <Toggle checked={c.enabled} onChange={(v) => void patch(c, { enabled: v })} />
+                  <Toggle checked={c.enabled} onChange={(v) => void patch(c, { enabled: v })} disabled={!canAdmin} />
                 </td>
                 <td className="pr-3">
-                  <Toggle checked={c.motionEnabled} onChange={(v) => void patch(c, { motionEnabled: v })} />
+                  <Toggle checked={c.motionEnabled} onChange={(v) => void patch(c, { motionEnabled: v })} disabled={!canAdmin} />
                 </td>
                 <td className="pr-3">
-                  <Toggle checked={c.aiVerify} onChange={(v) => void patch(c, { aiVerify: v })} disabled={!c.motionEnabled} />
+                  <Toggle checked={c.aiVerify} onChange={(v) => void patch(c, { aiVerify: v })} disabled={!canAdmin || !c.motionEnabled} />
                 </td>
                 <td className="pr-3">
-                  <input type="range" min={1} max={100} defaultValue={c.sensitivity} className="accent-[#22d3ee] w-28" onMouseUp={(e) => void patch(c, { sensitivity: Number((e.target as HTMLInputElement).value) })} onKeyUp={(e) => void patch(c, { sensitivity: Number((e.target as HTMLInputElement).value) })} />
+                  <input type="range" min={1} max={100} defaultValue={c.sensitivity} disabled={!canAdmin} className="accent-[#22d3ee] w-28" onMouseUp={(e) => canAdmin && void patch(c, { sensitivity: Number((e.target as HTMLInputElement).value) })} onKeyUp={(e) => canAdmin && void patch(c, { sensitivity: Number((e.target as HTMLInputElement).value) })} />
                   <span className="text-xs font-mono ml-1">{c.sensitivity}</span>
                 </td>
               </tr>
@@ -391,6 +408,8 @@ function CamerasTab() {
 
 // ───────────────────────── IA ─────────────────────────
 function AiTab() {
+  const { can } = useAuth();
+  const canAdmin = can("admin");
   const toast = useToast();
   const { data } = useApi<{ available: boolean; model: string; settings: { siteContext: string; businessHours: string; autoVerify: boolean } }>("/api/ai/status");
   const [form, setForm] = useState({ siteContext: "", businessHours: "", autoVerify: true });
@@ -401,13 +420,13 @@ function AiTab() {
     <Panel title="Inteligencia artificial (Claude)" icon={<Sparkles size={16} />} bodyClass="p-4 space-y-4 max-w-3xl">
       {data && (data.available ? <OkNote>Conectado con {data.model}. La API key se toma de la bóveda (tipo "Anthropic API").</OkNote> : <ErrorNote>No hay API key: cargue una credencial tipo "Anthropic API" en la Bóveda.</ErrorNote>)}
       <Field label="Contexto del sitio" hint="Ayuda a la IA a evaluar riesgos: tipo de instalación, zonas restringidas, qué es normal y qué no.">
-        <textarea className="input h-28" value={form.siteContext} onChange={(e) => setForm({ ...form, siteContext: e.target.value })} />
+        <textarea className="input h-28" readOnly={!canAdmin} value={form.siteContext} onChange={(e) => setForm({ ...form, siteContext: e.target.value })} />
       </Field>
       <Field label="Horario laboral">
-        <input className="input" value={form.businessHours} onChange={(e) => setForm({ ...form, businessHours: e.target.value })} />
+        <input className="input" readOnly={!canAdmin} value={form.businessHours} onChange={(e) => setForm({ ...form, businessHours: e.target.value })} />
       </Field>
-      <Toggle checked={form.autoVerify} onChange={(v) => setForm({ ...form, autoVerify: v })} label="Verificar automáticamente las alarmas de movimiento con IA (en cámaras con verificación activa)" />
-      <button
+      <Toggle checked={form.autoVerify} onChange={(v) => setForm({ ...form, autoVerify: v })} disabled={!canAdmin} label="Verificar automáticamente las alarmas de movimiento con IA (en cámaras con verificación activa)" />
+      {canAdmin && <button
         className="btn btn-primary"
         onClick={async () => {
           await api.put("/api/ai/settings", form);
@@ -416,17 +435,20 @@ function AiTab() {
       >
         Guardar
       </button>
+      }
     </Panel>
   );
 }
 
 // ───────────────────────── Integraciones ─────────────────────────
 function IntegrationsTab() {
+  const { can } = useAuth();
+  const canAdmin = can("admin");
   const { data: keys, reload } = useApi<Array<{ id: string; name: string; prefix: string; createdAt: number; lastUsedAt: number | null; revoked: number }>>("/api/ingest/keys");
   const [name, setName] = useState("");
   const [created, setCreated] = useState<string | null>(null);
   const example = `curl -X POST ${location.origin}/api/ingest/detections \\
-  -H "Authorization: Bearer ${created ?? "cia_XXXXXXXX"}" \\
+  -H "Authorization: Bearer ${(canAdmin && created) || "cia_XXXXXXXX"}" \\
   -H "Content-Type: application/json" \\
   -d '{"camera":"Acceso Principal","type":"person","severity":"high","title":"Persona detectada fuera de horario","confidence":0.91,"snapshot":"<jpeg base64>","verify":true}'`;
   return (
@@ -435,7 +457,7 @@ function IntegrationsTab() {
         <p className="text-sm text-ink-2">
           Permite que otros sistemas (Frigate, CodeProject.AI, analíticas de cámaras, scripts, Node-RED) envíen detecciones al centro. Opcionalmente se verifican con IA.
         </p>
-        <form
+        {canAdmin && <form
           className="flex gap-2"
           onSubmit={async (e) => {
             e.preventDefault();
@@ -449,8 +471,8 @@ function IntegrationsTab() {
           <button className="btn btn-primary" disabled={!name}>
             <Plus size={14} /> Crear clave
           </button>
-        </form>
-        {created && (
+        </form>}
+        {canAdmin && created && (
           <OkNote>
             Copie la clave ahora; no se volverá a mostrar:
             <code className="block font-mono text-xs mt-1 break-all select-all">{created}</code>
@@ -466,11 +488,11 @@ function IntegrationsTab() {
                 <td className="text-right">
                   {k.revoked ? (
                     <span className="text-xs text-muted">revocada</span>
-                  ) : (
+                  ) : canAdmin ? (
                     <button className="btn btn-ghost btn-sm text-muted hover:text-crit" onClick={async () => (await api.del(`/api/ingest/keys/${k.id}`), void reload())}>
                       Revocar
                     </button>
-                  )}
+                  ) : <span className="text-xs text-ok">activa</span>}
                 </td>
               </tr>
             ))}
@@ -561,10 +583,12 @@ function AuditTab() {
 }
 
 export default function Admin() {
+  const { can } = useAuth();
   const [tab, setTab] = useState<Tab>("servers");
   return (
     <div className="space-y-4">
       <PageHeader title="Administración" subtitle="Usuarios, servidores de video, cámaras, IA, integraciones y auditoría" icon={<ShieldCheck size={20} />} />
+      {!can("admin") && <div className="text-xs text-ink-2 rounded-lg border border-line bg-panel px-3 py-2">Acceso Tester: consulta de configuración y diagnósticos de exacqVision. Los cambios requieren un administrador.</div>}
       <Tabs
         value={tab}
         onChange={setTab}

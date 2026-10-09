@@ -15,7 +15,7 @@ Plataforma web tipo **NOC/SOC** para operar las cámaras de **exacqVision** de l
 **Seguridad de acceso**
 - Login con usuario/contraseña (**scrypt**, parámetros OWASP) + **2FA TOTP obligatorio** (Google/Microsoft Authenticator, FortiToken Mobile, Authy…) con **códigos de recuperación** de un solo uso.
 - Primer ingreso guiado: cambio de contraseña obligatorio → alta de 2FA → códigos de recuperación.
-- **Roles**: Administrador, Operador, Observador.
+- **Roles**: Administrador, Operador, Observador y **Tester (ChatGPT)** para consultas y diagnósticos con 2FA obligatorio.
 - **Re-autenticación 2FA** (step-up) para acciones sensibles: bóveda, perfiles VPN, usuarios, servidores.
 - Bloqueo por intentos fallidos, *rate limiting*, protección anti-enumeración de usuarios.
 - Sesiones con cookie `HttpOnly + Secure + SameSite=Strict`, expiración por inactividad y absoluta; listado y cierre remoto de sesiones.

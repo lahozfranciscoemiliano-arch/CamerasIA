@@ -5,9 +5,11 @@ import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 export type Row = Record<string, unknown>;
 type Params = Record<string, SQLInputValue | undefined | boolean>;
 
-const MIGRATIONS: string[] = [
+type Migration = { sql: string; rebuildTables?: boolean };
+
+const MIGRATIONS: Migration[] = [
   // 1 — esquema inicial
-  `
+  { sql: `
   CREATE TABLE users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT NOT NULL UNIQUE COLLATE NOCASE,
@@ -209,7 +211,51 @@ const MIGRATIONS: string[] = [
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
   );
-  `,
+  ` },
+  // 2 — rol Tester, conservando las cuentas y sus sesiones existentes.
+  { rebuildTables: true, sql: `
+  CREATE TABLE users_new (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    display_name TEXT,
+    role TEXT NOT NULL CHECK (role IN ('admin','operator','viewer','tester')),
+    password_hash TEXT NOT NULL,
+    totp_secret_enc TEXT,
+    totp_enabled INTEGER NOT NULL DEFAULT 0,
+    totp_last_step INTEGER NOT NULL DEFAULT 0,
+    recovery_codes TEXT NOT NULL DEFAULT '[]',
+    must_change_password INTEGER NOT NULL DEFAULT 0,
+    failed_attempts INTEGER NOT NULL DEFAULT 0,
+    locked_until INTEGER,
+    disabled INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    last_login_at INTEGER,
+    last_login_ip TEXT
+  );
+  INSERT INTO users_new (
+    id, username, display_name, role, password_hash, totp_secret_enc,
+    totp_enabled, totp_last_step, recovery_codes, must_change_password,
+    failed_attempts, locked_until, disabled, created_at, updated_at,
+    last_login_at, last_login_ip
+  ) SELECT
+    id, username, display_name, role, password_hash, totp_secret_enc,
+    totp_enabled, totp_last_step, recovery_codes, must_change_password,
+    failed_attempts, locked_until, disabled, created_at, updated_at,
+    last_login_at, last_login_ip
+  FROM users;
+  -- INSERT conserva los IDs actuales; sqlite_sequence también debe conservar
+  -- el máximo histórico para no reutilizar el ID de una cuenta eliminada.
+  UPDATE sqlite_sequence SET seq = MAX(seq, COALESCE(
+    (SELECT seq FROM sqlite_sequence WHERE name = 'users'), 0
+  )) WHERE name = 'users_new';
+  INSERT INTO sqlite_sequence(name, seq)
+    SELECT 'users_new', seq FROM sqlite_sequence
+    WHERE name = 'users'
+      AND NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'users_new');
+  DROP TABLE users;
+  ALTER TABLE users_new RENAME TO users;
+  ` },
 ];
 
 function clean(params?: Params): Record<string, SQLInputValue> | undefined {
@@ -228,7 +274,12 @@ export class Db {
     if (file !== ":memory:") fs.mkdirSync(path.dirname(file), { recursive: true });
     this.raw = new DatabaseSync(file);
     this.raw.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
-    this.migrate();
+    try {
+      this.migrate();
+    } catch (err) {
+      this.raw.close();
+      throw err;
+    }
   }
 
   private migrate() {
@@ -236,13 +287,24 @@ export class Db {
     const row = this.raw.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string } | undefined;
     let version = row?.value ? Number(row.value) : 0;
     while (version < MIGRATIONS.length) {
-      this.tx(() => {
-        this.raw.exec(MIGRATIONS[version]!);
+      const migration = MIGRATIONS[version]!;
+      // SQLite no permite cambiar foreign_keys dentro de una transacción.
+      // Dejarlo activo durante DROP users eliminaría sus sesiones en cascada.
+      if (migration.rebuildTables) this.raw.exec("PRAGMA foreign_keys = OFF");
+      try {
+        this.tx(() => {
+          this.raw.exec(migration.sql);
+          if (migration.rebuildTables && this.raw.prepare("PRAGMA foreign_key_check").all().length) {
+            throw new Error(`La migración ${version + 1} dejaría referencias inválidas en la base de datos`);
+          }
+          this.raw
+            .prepare("INSERT INTO meta(key, value) VALUES('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+            .run(String(version + 1));
+        });
         version += 1;
-        this.raw
-          .prepare("INSERT INTO meta(key, value) VALUES('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
-          .run(String(version));
-      });
+      } finally {
+        if (migration.rebuildTables) this.raw.exec("PRAGMA foreign_keys = ON");
+      }
     }
   }
 

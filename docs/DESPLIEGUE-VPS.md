@@ -112,6 +112,22 @@ bash scripts/restore.sh backups/camerasia-AAAA-MM-DD_HHMMSS.tgz   # restaurar (g
 
 Los respaldos (`backups/`, sólo root) contienen la base y las capturas, **no** la clave maestra: para restaurar en otra VPS copie también la misma `VAULT_MASTER_KEY` en su `.env`.
 
+### Crear una cuenta de revisión Tester
+
+La rama `claude/nifty-darwin-ca7zta` contiene la aplicación y el rol **Tester (ChatGPT)**. Para actualizar una instalación clonada en la ruta predeterminada:
+
+```bash
+cd /opt/camerasia
+git fetch origin
+git switch claude/nifty-darwin-ca7zta
+git pull --ff-only
+sudo bash scripts/install-vps.sh
+```
+
+Use la carpeta real de CamerasIA si difiere de `/opt/camerasia`. El instalador reconstruye y reinicia la aplicación; al iniciar se migra automáticamente la base existente para admitir el nuevo rol.
+
+Después, ingrese como Administrador en **Administración → Usuarios → Nuevo usuario**, seleccione **Tester (ChatGPT)** y establezca una contraseña temporal con al menos 12 caracteres. También puede asignar el rol a una cuenta existente. La cuenta sigue el cambio inicial de contraseña y el alta 2FA normal, y permite consultar cámaras, conectividad y configuración y ejecutar diagnósticos de exacq. Consulte [los permisos de Tester](SEGURIDAD.md#cuenta-tester-chatgpt). Deshabilite la cuenta cuando termine la revisión.
+
 ## Problemas frecuentes
 
 | Síntoma | Solución |

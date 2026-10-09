@@ -4,6 +4,7 @@ import type { FastifyInstance } from "fastify";
 import type { AppCtx } from "../context.js";
 import { HttpError, clientIp } from "../http/guards.js";
 import { ExacqSource } from "./client.js";
+import { diagnosticConfig } from "./diagnostics.js";
 import { publicCamera, type ExacqServerRow } from "./service.js";
 
 const PatchCamera = z.object({
@@ -160,9 +161,9 @@ export function registerCameraRoutes(app: FastifyInstance, ctx: AppCtx) {
     return reply.sendFile(job.file, ctx.cfg.paths.exports);
   });
 
-  // ───────── Servidores exacqVision (admin) ─────────
+  // ───────── Servidores exacqVision (administración y diagnósticos) ─────────
   app.get("/api/exacq/servers", async (req) => {
-    guard(req, { role: "admin" });
+    guard(req, { role: "tester" });
     return cameras.servers().map(publicServer);
   });
 
@@ -234,7 +235,7 @@ export function registerCameraRoutes(app: FastifyInstance, ctx: AppCtx) {
   };
 
   app.post<{ Params: { id: string } }>("/api/exacq/servers/:id/test", async (req) => {
-    guard(req, { role: "admin" });
+    guard(req, { role: "tester" });
     const src = exacqSource(req.params.id);
     const t0 = Date.now();
     try {
@@ -248,7 +249,7 @@ export function registerCameraRoutes(app: FastifyInstance, ctx: AppCtx) {
   });
 
   app.post<{ Params: { id: string }; Body: { cameraId?: string } }>("/api/exacq/servers/:id/detect", async (req) => {
-    const a = guard(req, { role: "admin" });
+    const a = guard(req, { role: "tester" });
     const src = exacqSource(req.params.id);
     const cameraId = String(req.body?.cameraId ?? (await src.listCameras())[0]?.cameraId ?? "");
     if (!cameraId) throw new HttpError(400, "No hay cámaras para probar");
@@ -258,7 +259,8 @@ export function registerCameraRoutes(app: FastifyInstance, ctx: AppCtx) {
   });
 
   app.get<{ Params: { id: string } }>("/api/exacq/servers/:id/raw-config", async (req) => {
-    guard(req, { role: "admin" });
-    return exacqSource(req.params.id).rawConfig();
+    const a = guard(req, { role: "tester" });
+    const config = await exacqSource(req.params.id).rawConfig();
+    return a.user.role === "tester" ? diagnosticConfig(config) : config;
   });
 }

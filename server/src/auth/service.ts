@@ -12,7 +12,7 @@ import {
   verifyTotp,
 } from "../security/totp.js";
 
-export type Role = "admin" | "operator" | "viewer";
+export type Role = "admin" | "operator" | "viewer" | "tester";
 
 export interface UserRow {
   id: number;
@@ -321,6 +321,7 @@ export class AuthService {
 
   /** Alternativa cuando el usuario aún no tiene 2FA (sólo posible si REQUIRE_2FA=false). */
   async stepUpWithPassword(ctx: AuthContext, password: string, ip: string) {
+    if (this.cfg.REQUIRE_2FA || ctx.user.role === "tester") throw new AuthError("Debe activar y usar su código 2FA", 403, "mfa_required");
     if (ctx.user.totp_enabled) throw new AuthError("Use su código 2FA", 400, "mfa_required");
     if (!(await verifyPassword(password, ctx.user.password_hash))) {
       this.audit.log({ userId: ctx.user.id, username: ctx.user.username, action: "auth.step_up", ip, outcome: "failure" });
@@ -363,6 +364,8 @@ export class AuthService {
     this.pendingEnroll.delete(ctx.user.id);
     const now = Date.now();
     this.db.run("UPDATE sessions SET mfa_verified = 1, step_up_at = $now WHERE id = $id", { now, id: ctx.session.id });
+    // Las sesiones abiertas antes del alta no verificaron este segundo factor.
+    this.revokeAllSessions(ctx.user.id, ctx.session.id);
     this.audit.log({ userId: ctx.user.id, username: ctx.user.username, action: "auth.totp_enabled", ip });
     return codes;
   }
@@ -421,7 +424,7 @@ export class AuthService {
   restrictions(ctx: AuthContext) {
     return {
       mustChangePassword: Boolean(ctx.user.must_change_password),
-      mustEnrollTotp: this.cfg.REQUIRE_2FA && !ctx.user.totp_enabled,
+      mustEnrollTotp: (this.cfg.REQUIRE_2FA || ctx.user.role === "tester") && !ctx.user.totp_enabled,
     };
   }
 }

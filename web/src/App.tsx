@@ -60,7 +60,7 @@ function Gate() {
               <Route
                 path="boveda"
                 element={
-                  <RequireRole role="admin">
+                  <RequireRole role="tester">
                     <Vault />
                   </RequireRole>
                 }
@@ -68,7 +68,7 @@ function Gate() {
               <Route
                 path="admin"
                 element={
-                  <RequireRole role="admin">
+                  <RequireRole role="tester">
                     <Admin />
                   </RequireRole>
                 }
