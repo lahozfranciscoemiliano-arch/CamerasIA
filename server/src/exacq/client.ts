@@ -44,6 +44,8 @@ export const DEFAULT_LIVE_CANDIDATES = [
  */
 export function normalizeBaseUrl(input: string): string {
   let s = input.trim();
+  // "http:/x", "http//x", "https:x": esquema mal escrito → que falle la validación en vez de inventar el host "http"
+  if (/^https?(:\/?(?!\/)|\/\/)/i.test(s)) throw new TypeError("Esquema mal escrito");
   if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(s)) s = `http://${s}`;
   const u = new URL(s);
   u.hash = "";
@@ -87,18 +89,32 @@ export interface ExacqServerConfig {
 }
 
 export interface ExacqHooks {
-  /** Se llama cuando el cliente detecta (y empieza a usar) plantillas de video que funcionan: persistirlas. */
-  onTemplates?: (t: { snapshot?: string; live?: string }) => void;
+  /**
+   * Se llama cuando el cliente adopta plantillas de video que funcionan, para persistirlas.
+   * `reason`: "auto" (autocorrección al fallar la imagen) o "detect" (pedido explícito de un administrador).
+   */
+  onTemplates?: (t: { snapshot?: string; live?: string }, reason: "auto" | "detect") => void;
 }
 
 export class ExacqError extends Error {
   constructor(
     message: string,
     public kind: "network" | "auth" | "protocol" | "not_found" = "protocol",
+    /** Código HTTP de la respuesta que originó el error, si la hubo. */
+    public status?: number,
   ) {
     super(message);
   }
 }
+
+/**
+ * ¿La respuesta indica que la URL de imagen no existe en esta versión del Web Service (y conviene
+ * probar otra plantilla)? Los 5xx y cortes son transitorios: no justifican cambiar de plantilla.
+ */
+const isTemplateMismatch = (e: unknown) =>
+  e instanceof ExacqError &&
+  e.kind === "protocol" &&
+  (e.status === undefined || (e.status >= 200 && e.status < 500 && ![401, 403, 408, 429].includes(e.status)));
 
 
 /**
@@ -205,6 +221,8 @@ export interface Diagnosis {
   snapshotTemplate?: string;
   /** Sugerencia accionable (p. ej. usar http:// en vez de https://). */
   suggestion?: { baseUrl: string; reason: string };
+  /** Plantilla de imagen que sí funciona cuando la configurada no (se guarda con "Detectar video"). */
+  workingSnapshotTemplate?: string;
 }
 
 /** Cada cuánto, como máximo, se re-detecta la plantilla de snapshot cuando la actual falla. */
@@ -220,7 +238,8 @@ export class ExacqSource implements VideoSource {
   /** Desfase horario (horas) informado por config.web; se usa si el servidor no tiene zona configurada. */
   private serverOffset: number | null = null;
   private healing: Promise<string | null> | null = null;
-  private lastHealAt = 0;
+  /** Último intento de autocorrección por cámara (una cámara sin video no bloquea a las demás). */
+  private healAttempts = new Map<string, number>();
 
   constructor(
     private cfg: ExacqServerConfig,
@@ -387,50 +406,71 @@ export class ExacqSource implements VideoSource {
     return this.cfg.snapshotTemplate || DEFAULT_SNAPSHOT_CANDIDATES[0]!;
   }
 
-  private applyTemplates(t: { snapshot?: string; live?: string }) {
-    if (t.snapshot) this.cfg.snapshotTemplate = t.snapshot;
-    if (t.live) this.cfg.liveTemplate = t.live;
-    if (t.snapshot || t.live) this.hooks.onTemplates?.(t);
+  private applyTemplates(t: { snapshot?: string; live?: string }, reason: "auto" | "detect") {
+    const adopted: { snapshot?: string; live?: string } = {};
+    if (t.snapshot) adopted.snapshot = this.cfg.snapshotTemplate = t.snapshot;
+    if (t.live) adopted.live = this.cfg.liveTemplate = t.live;
+    if (adopted.snapshot || adopted.live) this.hooks.onTemplates?.(adopted, reason);
   }
 
   /**
-   * Cuadro en vivo. Si la plantilla activa no devuelve imagen (404/400/otro formato), prueba las
-   * candidatas conocidas (como máximo cada 10 min) y adopta y guarda la primera que funcione.
+   * Cuadro en vivo. Si la plantilla activa no existe en esta versión (404/400/otro formato), prueba
+   * las candidatas conocidas y adopta y guarda la primera que funcione. Nunca reemplaza una
+   * plantilla personalizada por el administrador ni reacciona a errores transitorios (5xx, red).
    */
-  async snapshot(cameraId: string, opts: { quality?: number; forceHeal?: boolean } = {}): Promise<Snapshot> {
+  async snapshot(cameraId: string, opts: { quality?: number } = {}): Promise<Snapshot> {
     const template = this.activeSnapshotTemplate();
     try {
       return await this.snapshotWith(template, cameraId, opts.quality);
     } catch (e) {
-      if (!(e instanceof ExacqError) || e.kind !== "protocol") throw e;
-      const healed = await this.healSnapshotTemplate(cameraId, template, opts.forceHeal);
+      if (!isTemplateMismatch(e)) throw e;
+      const healed = await this.healSnapshotTemplate(cameraId, template);
       if (!healed) throw e;
       return this.snapshotWith(healed, cameraId, opts.quality);
     }
   }
 
-  private async healSnapshotTemplate(cameraId: string, failed: string, force = false): Promise<string | null> {
+  /** Sólo se autocorrigen la plantilla por defecto o una adoptada de la lista conocida. */
+  private canAutoHeal() {
+    return !this.cfg.snapshotTemplate || DEFAULT_SNAPSHOT_CANDIDATES.includes(this.cfg.snapshotTemplate);
+  }
+
+  /** Prueba las candidatas (salvo `skip`) contra una cámara. `network` = no se pudo completar la prueba. */
+  private async probeSnapshotCandidates(cameraId: string, skip?: string): Promise<{ template: string | null; network: boolean }> {
+    for (const tpl of DEFAULT_SNAPSHOT_CANDIDATES) {
+      if (tpl === skip) continue;
+      try {
+        await this.snapshotWith(tpl, cameraId);
+        return { template: tpl, network: false };
+      } catch (err) {
+        if (!(err instanceof ExacqError) || err.kind === "network" || err.kind === "auth") return { template: null, network: true };
+      }
+    }
+    return { template: null, network: false };
+  }
+
+  private async healSnapshotTemplate(cameraId: string, failed: string): Promise<string | null> {
     const current = this.activeSnapshotTemplate();
     if (current !== failed) return current; // otra petición ya la reemplazó
-    if (!this.healing) {
-      if (!force && Date.now() - this.lastHealAt < HEAL_INTERVAL_MS) return null;
-      this.lastHealAt = Date.now();
-      this.healing = (async () => {
-        for (const tpl of DEFAULT_SNAPSHOT_CANDIDATES) {
-          if (tpl === failed) continue;
-          try {
-            await this.snapshotWith(tpl, cameraId);
-            this.applyTemplates({ snapshot: tpl });
-            return tpl;
-          } catch (err) {
-            if (err instanceof ExacqError && err.kind === "network") return null;
-          }
-        }
-        return null;
-      })().finally(() => {
-        this.healing = null;
-      });
-    }
+    if (!this.canAutoHeal()) return null;
+    if (this.healing) return this.healing;
+    if (Date.now() - (this.healAttempts.get(cameraId) ?? 0) < HEAL_INTERVAL_MS) return null;
+    this.healing = (async () => {
+      const r = await this.probeSnapshotCandidates(cameraId, failed);
+      if (r.template) {
+        this.healAttempts.clear();
+        this.applyTemplates({ snapshot: r.template }, "auto");
+        return r.template;
+      }
+      // Sólo se espera para reintentar si la prueba fue concluyente (no por un corte de red).
+      if (!r.network) {
+        if (this.healAttempts.size > 1000) this.healAttempts.clear();
+        this.healAttempts.set(cameraId, Date.now());
+      }
+      return null;
+    })().finally(() => {
+      this.healing = null;
+    });
     return this.healing;
   }
 
@@ -447,7 +487,7 @@ export class ExacqSource implements VideoSource {
         this.session = null;
         continue;
       }
-      throw new ExacqError(`Snapshot HTTP ${res.status} (${ct || "sin content-type"})`, "protocol");
+      throw new ExacqError(`Snapshot HTTP ${res.status} (${ct || "sin content-type"})`, "protocol", res.status);
     }
     throw new ExacqError("No se obtuvo imagen: revise la plantilla de snapshot del servidor", "protocol");
   }
@@ -551,7 +591,7 @@ export class ExacqSource implements VideoSource {
       }
     }
     if (opts.apply) {
-      this.applyTemplates({ snapshot: result.snapshot ?? undefined, live: result.live ?? undefined });
+      this.applyTemplates({ snapshot: result.snapshot ?? undefined, live: result.live ?? undefined }, "detect");
       result.applied = Boolean(result.snapshot || result.live);
     }
     return result;
@@ -559,9 +599,9 @@ export class ExacqSource implements VideoSource {
 
   /**
    * Diagnóstico paso a paso para el botón "Probar": conexión → login → cámaras → imagen.
-   * Con `heal`, si la URL de imagen no responde se re-detecta y guarda en el acto.
+   * Es de sólo lectura: si la URL de imagen no responde, informa cuál funciona pero no la guarda.
    */
-  async diagnose(opts: { heal?: boolean } = {}): Promise<Diagnosis> {
+  async diagnose(): Promise<Diagnosis> {
     const steps: DiagnosisStep[] = [];
     const out: Diagnosis = { ok: false, steps };
     const run = async <T>(step: string, fn: () => Promise<T>, detail: (v: T) => string): Promise<T | undefined> => {
@@ -602,7 +642,19 @@ export class ExacqSource implements VideoSource {
       return out;
     }
 
-    if (!(await run("Inicio de sesión", () => this.sessionId(), () => "Credenciales aceptadas"))) return out;
+    // Login nuevo (no la sesión en caché) para verificar de verdad las credenciales guardadas.
+    const login = await run(
+      "Inicio de sesión",
+      async () => {
+        const old = this.session;
+        this.session = null;
+        const fresh = await this.login();
+        if (old && old !== fresh) void this.logoutSession(old);
+        return fresh;
+      },
+      () => "Credenciales aceptadas",
+    );
+    if (!login) return out;
 
     const cams = await run(
       "Cámaras (config.web)",
@@ -620,22 +672,41 @@ export class ExacqSource implements VideoSource {
       steps.push({ step: "Imagen en vivo", ok: false, detail: "El servidor no informó cámaras (¿el usuario tiene permisos sobre ellas?)" });
       return out;
     }
-    const before = this.activeSnapshotTemplate();
-    await run(
+    const active = this.activeSnapshotTemplate();
+    out.snapshotTemplate = active;
+    const snap = await run(
       `Imagen en vivo (${cam.name})`,
-      () => this.snapshot(cam.cameraId, { forceHeal: opts.heal }),
-      (snap) =>
-        `${Math.round(snap.data.length / 1024)} KB ${snap.contentType}` +
-        (this.activeSnapshotTemplate() !== before ? ` · URL de video detectada y guardada: ${this.activeSnapshotTemplate()}` : ""),
+      () => this.snapshotWith(active, cam.cameraId),
+      (img) => `${Math.round(img.data.length / 1024)} KB ${img.contentType}`,
     );
-    out.snapshotTemplate = this.activeSnapshotTemplate();
+    if (!snap) {
+      const probe = await this.probeSnapshotCandidates(cam.cameraId, active);
+      if (probe.template) {
+        out.workingSnapshotTemplate = probe.template;
+        const step = steps[steps.length - 1]!;
+        if (this.canAutoHeal()) {
+          // El video funcionará igual: la primera imagen que pida un visor adopta esta URL.
+          step.ok = true;
+          step.detail = `La URL configurada no responde en esta versión; se usará automáticamente ${probe.template}`;
+        } else {
+          step.detail += ` · Funciona ${probe.template}: un administrador puede guardarla con "Detectar video".`;
+        }
+      }
+    }
     out.ok = steps.every((s) => s.ok);
     return out;
   }
 
+  private async logoutSession(session: string) {
+    await this.fetchRaw(this.url(`v1/logout.web?${new URLSearchParams({ s: session })}`), { method: "POST" })
+      .then((r) => r.body?.cancel())
+      .catch(() => undefined);
+  }
+
   async dispose() {
     if (!this.session) return;
-    await this.fetchRaw(this.url(`v1/logout.web?${new URLSearchParams({ s: this.session })}`), { method: "POST" }).catch(() => undefined);
+    const s = this.session;
     this.session = null;
+    await this.logoutSession(s);
   }
 }

@@ -246,22 +246,25 @@ export function registerCameraRoutes(app: FastifyInstance, ctx: AppCtx) {
   };
 
   app.post<{ Params: { id: string } }>("/api/exacq/servers/:id/test", async (req) => {
-    const a = guard(req, { role: "tester" });
+    guard(req, { role: "tester" });
     const src = exacqSource(req.params.id);
     const t0 = Date.now();
-    // Sólo un administrador puede hacer que el diagnóstico re-detecte y guarde la URL de video.
-    const result = await src.diagnose({ heal: a.user.role === "admin" });
+    const result = await src.diagnose();
     if (result.cameras !== undefined) await cameras.sync().catch(() => undefined);
     return { ...result, latencyMs: Date.now() - t0 };
   });
 
   app.post<{ Params: { id: string }; Body: { cameraId?: string } }>("/api/exacq/servers/:id/detect", async (req) => {
-    const a = guard(req, { role: "tester" });
+    let a = guard(req, { role: "tester" });
+    // Guardar la URL detectada modifica la configuración: sólo Administrador y con 2FA reciente,
+    // igual que editar el servidor. Tester obtiene el resultado sin guardar.
+    const apply = a.user.role === "admin";
+    if (apply) a = guard(req, { role: "admin", stepUp: true });
     const src = exacqSource(req.params.id);
     const list = req.body?.cameraId ? [] : await src.listCameras();
     const cameraId = String(req.body?.cameraId ?? (list.find((c) => c.online) ?? list[0])?.cameraId ?? "");
     if (!cameraId) throw new HttpError(400, "No hay cámaras para probar");
-    const result = await src.detectTemplates(cameraId, { apply: a.user.role === "admin" });
+    const result = await src.detectTemplates(cameraId, { apply });
     audit.log({ userId: a.user.id, username: a.user.username, action: "exacq.detect_templates", target: req.params.id, ip: clientIp(req), details: { snapshot: result.snapshot, live: result.live, applied: result.applied } });
     return result;
   });

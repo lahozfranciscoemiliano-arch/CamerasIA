@@ -73,6 +73,10 @@ export async function buildApp(cfg: AppConfig, opts: { logger?: boolean } = {}):
     demo: cfg.DEMO_MODE,
     exportsDir: cfg.paths.exports,
     log,
+    onTemplatesAdopted: (server, t, reason) => {
+      // "detect" ya lo audita la ruta con el usuario que lo pidió.
+      if (reason === "auto") audit.log({ username: "sistema", action: "exacq.template_auto", target: server.name, details: t });
+    },
     onCameraStatusChange: (cam, online) => {
       if (online) {
         events.autoResolve("camera_offline", cam.id);

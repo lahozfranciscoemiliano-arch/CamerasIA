@@ -95,6 +95,8 @@ export class CameraService {
       exportsDir: string;
       log: (msg: string) => void;
       onCameraStatusChange?: (cam: CameraRow, online: boolean) => void;
+      /** Plantillas de video adoptadas por un servidor (para auditoría). */
+      onTemplatesAdopted?: (server: { id: string; name: string }, t: { snapshot?: string; live?: string }, reason: "auto" | "detect") => void;
       onSourceStatus?: (sourceId: string, name: string, status: SourceStatus) => void;
     },
   ) {
@@ -148,13 +150,14 @@ export class CameraService {
         },
         {
           // El cliente detectó URLs de video que funcionan: se guardan para los próximos reinicios.
-          onTemplates: (t) => {
+          onTemplates: (t, reason) => {
             this.db.run(
               `UPDATE exacq_servers SET snapshot_template = COALESCE($snap, snapshot_template), live_template = COALESCE($live, live_template),
                updated_at = $now WHERE id = $id`,
               { snap: t.snapshot ?? null, live: t.live ?? null, now: Date.now(), id: srv.id },
             );
-            this.opts.log(`exacqVision ${srv.name}: plantilla de video adoptada ${JSON.stringify(t)}`);
+            this.opts.log(`exacqVision ${srv.name}: plantilla de video adoptada (${reason}) ${JSON.stringify(t)}`);
+            this.opts.onTemplatesAdopted?.({ id: srv.id, name: srv.name }, t, reason);
           },
         },
       );
@@ -196,7 +199,11 @@ export class CameraService {
           );
           return;
         }
-        this.db.run("UPDATE cameras SET raw = $raw, online = $online, last_seen_at = COALESCE($seen, last_seen_at) WHERE id = $id", {
+        // El nombre lo puede cambiar el administrador en CamerasIA: sólo se corrige si quedó vacío o
+        // difiere en espacios del que informa el VMS (versiones anteriores no los recortaban).
+        const fixName = !prev.name.trim() || (prev.name !== c.name && prev.name.trim().replace(/\s+/g, " ") === c.name);
+        this.db.run("UPDATE cameras SET name = $name, raw = $raw, online = $online, last_seen_at = COALESCE($seen, last_seen_at) WHERE id = $id", {
+          name: fixName ? c.name : prev.name,
           raw: JSON.stringify(c.raw ?? null).slice(0, 20_000),
           online: c.online,
           seen: c.online ? now : null,

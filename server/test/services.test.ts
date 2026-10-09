@@ -243,14 +243,16 @@ test("exacqVision 23.09 simulado: diagnóstico completo y detección que guarda 
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
   const port = (server.address() as AddressInfo).port;
   try {
-    const adopted: Array<{ snapshot?: string; live?: string }> = [];
+    const adopted: Array<{ snapshot?: string; live?: string; reason?: string }> = [];
     const src = new ExacqSource(
       // Plantilla vieja guardada que ya no existe en 23.09
       { id: "s23", name: "Central", baseUrl: `http://127.0.0.1:${port}`, snapshotTemplate: "/v1/image.web?s={session}&camera={camera}&quality={quality}" },
       () => ({ username: "admin", password: "x" }),
       undefined,
-      { onTemplates: (t) => adopted.push(t) },
+      { onTemplates: (t, reason) => adopted.push({ ...t, reason }) },
     );
+    // "Probar" es de sólo lectura: informa la URL que funciona pero no la guarda (la plantilla
+    // vieja es de la lista conocida, así que el video se autocorrige al primer uso).
     const d = await src.diagnose();
     assert.deepEqual(
       d.steps.map((s) => s.ok),
@@ -258,17 +260,42 @@ test("exacqVision 23.09 simulado: diagnóstico completo y detección que guarda 
       JSON.stringify(d.steps),
     );
     assert.equal(d.ok, true);
+    assert.match(d.steps[3]!.detail, /se usará automáticamente/);
     assert.equal(d.cameras, 2);
     assert.equal(d.online, 1);
     assert.equal(d.disabled, 1);
     assert.match(d.steps[3]!.step, /ALMACEN PB/);
-    assert.equal(d.snapshotTemplate, "/v1/video.web?s={session}&camera={camera}&fmt=jpg");
-    assert.deepEqual(adopted, [{ snapshot: "/v1/video.web?s={session}&camera={camera}&fmt=jpg" }]);
+    assert.equal(d.workingSnapshotTemplate, "/v1/video.web?s={session}&camera={camera}&fmt=jpg");
+    assert.deepEqual(adopted, []);
 
+    // Tester: detecta sin guardar
+    const dry = await src.detectTemplates("1376768", { apply: false });
+    assert.equal(dry.snapshot, "/v1/video.web?s={session}&camera={camera}&fmt=jpg");
+    assert.equal(dry.applied, false);
+    assert.deepEqual(adopted, []);
+
+    // Administrador: detecta y guarda
     const det = await src.detectTemplates("1376768");
     assert.equal(det.snapshot, "/v1/video.web?s={session}&camera={camera}&fmt=jpg");
     assert.equal(det.live, null);
     assert.equal(det.applied, true);
+    assert.deepEqual(adopted, [{ snapshot: "/v1/video.web?s={session}&camera={camera}&fmt=jpg", reason: "detect" }]);
+    const ok = await src.diagnose();
+    assert.equal(ok.ok, true, JSON.stringify(ok.steps));
+
+    // Una plantilla personalizada por el administrador nunca se reemplaza sola.
+    const custom = new ExacqSource(
+      { id: "c", name: "C", baseUrl: `http://127.0.0.1:${port}`, snapshotTemplate: "/v1/propia.web?s={session}&camera={camera}" },
+      () => ({ username: "admin", password: "x" }),
+      undefined,
+      { onTemplates: (t, reason) => adopted.push({ ...t, reason }) },
+    );
+    await assert.rejects(custom.snapshot("1376768"), /Snapshot HTTP 404/);
+    assert.equal(adopted.length, 1);
+    const dc = await custom.diagnose();
+    assert.equal(dc.ok, false);
+    assert.match(dc.steps[3]!.detail, /Detectar video/);
+    assert.equal(adopted.length, 1);
 
     // Servidor caído → mensaje con la causa, no "fetch failed"
     const tmp = http.createServer();
