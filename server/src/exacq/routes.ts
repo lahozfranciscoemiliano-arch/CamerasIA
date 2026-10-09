@@ -3,7 +3,7 @@ import { z } from "zod";
 import type { FastifyInstance } from "fastify";
 import type { AppCtx } from "../context.js";
 import { HttpError, clientIp } from "../http/guards.js";
-import { ExacqSource } from "./client.js";
+import { ExacqSource, normalizeBaseUrl } from "./client.js";
 import { diagnosticConfig } from "./diagnostics.js";
 import { publicCamera, type ExacqServerRow } from "./service.js";
 
@@ -28,10 +28,21 @@ const template = z
 
 const ServerBody = z.object({
   name: z.string().min(1).max(80),
-  baseUrl: z
-    .string()
-    .url()
-    .refine((u) => /^https?:\/\//.test(u), "Use http:// o https://"),
+  baseUrl: z.preprocess(
+    (v) => {
+      if (typeof v !== "string") return v;
+      try {
+        return normalizeBaseUrl(v);
+      } catch {
+        return v;
+      }
+    },
+    z
+      .string()
+      .url("URL inválida: use por ejemplo http://192.168.109.58")
+      .refine((u) => /^https?:\/\//.test(u), "Use http:// o https://")
+      .refine((u) => !/^https?:\/\/[^/]*@/.test(u), "No incluya usuario/contraseña en la URL: use una credencial de la bóveda"),
+  ),
   credentialId: z.string().uuid().nullable().optional(),
   enabled: z.boolean().default(true),
   snapshotTemplate: template.nullable().optional(),
@@ -235,26 +246,23 @@ export function registerCameraRoutes(app: FastifyInstance, ctx: AppCtx) {
   };
 
   app.post<{ Params: { id: string } }>("/api/exacq/servers/:id/test", async (req) => {
-    guard(req, { role: "tester" });
+    const a = guard(req, { role: "tester" });
     const src = exacqSource(req.params.id);
     const t0 = Date.now();
-    try {
-      await src.login();
-      const cams = await src.listCameras();
-      await cameras.sync();
-      return { ok: true, latencyMs: Date.now() - t0, cameras: cams.length, sample: cams.slice(0, 5).map((c) => ({ id: c.cameraId, name: c.name })) };
-    } catch (e) {
-      return { ok: false, latencyMs: Date.now() - t0, error: (e as Error).message };
-    }
+    // Sólo un administrador puede hacer que el diagnóstico re-detecte y guarde la URL de video.
+    const result = await src.diagnose({ heal: a.user.role === "admin" });
+    if (result.cameras !== undefined) await cameras.sync().catch(() => undefined);
+    return { ...result, latencyMs: Date.now() - t0 };
   });
 
   app.post<{ Params: { id: string }; Body: { cameraId?: string } }>("/api/exacq/servers/:id/detect", async (req) => {
     const a = guard(req, { role: "tester" });
     const src = exacqSource(req.params.id);
-    const cameraId = String(req.body?.cameraId ?? (await src.listCameras())[0]?.cameraId ?? "");
+    const list = req.body?.cameraId ? [] : await src.listCameras();
+    const cameraId = String(req.body?.cameraId ?? (list.find((c) => c.online) ?? list[0])?.cameraId ?? "");
     if (!cameraId) throw new HttpError(400, "No hay cámaras para probar");
-    const result = await src.detectTemplates(cameraId);
-    audit.log({ userId: a.user.id, username: a.user.username, action: "exacq.detect_templates", target: req.params.id, ip: clientIp(req), details: { snapshot: result.snapshot, live: result.live } });
+    const result = await src.detectTemplates(cameraId, { apply: a.user.role === "admin" });
+    audit.log({ userId: a.user.id, username: a.user.username, action: "exacq.detect_templates", target: req.params.id, ip: clientIp(req), details: { snapshot: result.snapshot, live: result.live, applied: result.applied } });
     return result;
   });
 

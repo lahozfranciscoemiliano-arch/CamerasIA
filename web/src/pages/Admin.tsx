@@ -175,7 +175,7 @@ function ServersTab() {
   const [open, setOpen] = useState(false);
   const [form, setForm] = useState<Partial<ExacqServer>>({});
   const [error, setError] = useState("");
-  const [result, setResult] = useState<{ title: string; body: unknown } | null>(null);
+  const [result, setResult] = useState<{ title: string; kind: "test" | "detect" | "raw"; serverId: string; body: unknown } | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
   const edit = (s: ExacqServer | null) => {
@@ -209,7 +209,12 @@ function ServersTab() {
     setBusy(`${id}:${kind}`);
     try {
       const r = kind === "raw" ? await api.get(`/api/exacq/servers/${id}/raw-config`) : await api.post(`/api/exacq/servers/${id}/${kind}`);
-      setResult({ title: kind === "test" ? "Prueba de conexión" : kind === "detect" ? "Detección de URLs de video" : canAdmin ? "config.web (JSON crudo)" : "Diagnóstico de cámaras (config.web)", body: r });
+      setResult({
+        title: kind === "test" ? "Prueba de conexión" : kind === "detect" ? "Detección de URLs de video" : canAdmin ? "config.web (JSON crudo)" : "Diagnóstico de cámaras (config.web)",
+        kind,
+        serverId: id,
+        body: r,
+      });
       void reload();
     } catch (e) {
       toast({ tone: "error", title: (e as ApiError).message });
@@ -286,7 +291,7 @@ function ServersTab() {
           <Field label="Nombre">
             <input className="input" value={form.name ?? ""} onChange={(e) => setForm({ ...form, name: e.target.value })} />
           </Field>
-          <Field label="URL del Web Service" hint="IP interna, p. ej. http://192.168.109.58 (o :8080 si cambió el puerto)">
+          <Field label="URL del Web Service" hint="La misma dirección con la que abre el cliente web de exacq, normalmente http:// (p. ej. http://192.168.109.58, o :8080 si cambió el puerto)">
             <input className="input font-mono" value={form.baseUrl ?? ""} onChange={(e) => setForm({ ...form, baseUrl: e.target.value })} />
           </Field>
           <Field label="Credencial (bóveda)">
@@ -318,13 +323,13 @@ function ServersTab() {
             <Toggle checked={form.enabled ?? true} onChange={(v) => setForm({ ...form, enabled: v })} label="Habilitado" />
           </div>
           <div className="sm:col-span-2">
-            <Field label="Plantilla de snapshot (opcional)" hint="Variables {session} {camera} {quality}. Vacío = valor por defecto. Use 'Detectar video' o copie la URL desde F12 → Red en el cliente web de exacq.">
-              <input className="input font-mono text-xs" value={form.snapshotTemplate ?? ""} onChange={(e) => setForm({ ...form, snapshotTemplate: e.target.value })} placeholder="/v1/image.web?s={session}&camera={camera}&quality={quality}" />
+            <Field label="Plantilla de snapshot (opcional)" hint="Variables {session} {camera} {quality}. Vacío = automático: se prueban las URLs conocidas y se guarda la que funcione ('Detectar video' lo hace a pedido).">
+              <input className="input font-mono text-xs" value={form.snapshotTemplate ?? ""} onChange={(e) => setForm({ ...form, snapshotTemplate: e.target.value })} placeholder="/v1/video.web?s={session}&camera={camera}&fmt=jpg" />
             </Field>
           </div>
           <div className="sm:col-span-2">
             <Field label="Plantilla de stream MJPEG (opcional)" hint="Si se define y responde multipart, se usa para video fluido; si no, se arma el video con snapshots.">
-              <input className="input font-mono text-xs" value={form.liveTemplate ?? ""} onChange={(e) => setForm({ ...form, liveTemplate: e.target.value })} placeholder="/v1/video.web?s={session}&camera={camera}&format=mjpeg" />
+              <input className="input font-mono text-xs" value={form.liveTemplate ?? ""} onChange={(e) => setForm({ ...form, liveTemplate: e.target.value })} placeholder="/v1/video.web?s={session}&camera={camera}&fmt=mjpg" />
             </Field>
           </div>
         </div>
@@ -333,9 +338,126 @@ function ServersTab() {
         </div>
       </Modal>
       <Modal open={Boolean(result)} onClose={() => setResult(null)} title={result?.title ?? ""} width={760}>
-        <pre className="font-mono text-xs bg-bg p-3 rounded-lg border border-line overflow-auto max-h-[60vh]">{JSON.stringify(result?.body, null, 2)}</pre>
+        {result?.kind === "test" ? (
+          <DiagnosisView
+            d={result.body as Diagnosis}
+            onUseUrl={!canAdmin ? undefined : async (baseUrl) => {
+              try {
+                await api.patch(`/api/exacq/servers/${result.serverId}`, { baseUrl });
+                toast({ tone: "ok", title: `URL cambiada a ${baseUrl}` });
+                setResult(null);
+                void reload();
+                void action(result.serverId, "test");
+              } catch (e) {
+                toast({ tone: "error", title: (e as ApiError).message });
+              }
+            }}
+          />
+        ) : result?.kind === "detect" ? (
+          <DetectView d={result.body as Detection} />
+        ) : (
+          <pre className="font-mono text-xs bg-bg p-3 rounded-lg border border-line overflow-auto max-h-[60vh]">{JSON.stringify(result?.body, null, 2)}</pre>
+        )}
       </Modal>
     </Panel>
+  );
+}
+
+interface Diagnosis {
+  ok: boolean;
+  steps: Array<{ step: string; ok: boolean; detail: string; ms?: number }>;
+  cameras?: number;
+  online?: number;
+  disabled?: number;
+  sample?: Array<{ id: string; name: string; online: boolean }>;
+  snapshotTemplate?: string;
+  suggestion?: { baseUrl: string; reason: string };
+  latencyMs?: number;
+}
+
+interface Detection {
+  snapshot: string | null;
+  live: string | null;
+  applied?: boolean;
+  tried: Array<{ template: string; result: string }>;
+}
+
+function DiagnosisView({ d, onUseUrl }: { d: Diagnosis; onUseUrl?: (baseUrl: string) => Promise<void> }) {
+  const [busy, setBusy] = useState(false);
+  return (
+    <div className="space-y-3">
+      <ol className="space-y-2">
+        {d.steps.map((s, i) => (
+          <li key={i} className="flex items-start gap-2 rounded-lg border border-line px-3 py-2">
+            {s.ok ? <CheckCircle2 size={16} className="mt-0.5 shrink-0 text-ok" /> : <XCircle size={16} className="mt-0.5 shrink-0 text-crit" />}
+            <div className="min-w-0 flex-1">
+              <div className="text-sm font-semibold">
+                {s.step} {s.ms !== undefined && <span className="text-xs font-normal text-muted">· {s.ms} ms</span>}
+              </div>
+              <div className="text-xs text-ink-2 break-words">{s.detail}</div>
+            </div>
+          </li>
+        ))}
+      </ol>
+      {d.suggestion && (
+        <div className="rounded-lg border border-warn/40 bg-warn/10 px-3 py-2 text-sm flex flex-wrap items-center gap-3">
+          <div className="flex-1 min-w-0">{d.suggestion.reason}</div>
+          {onUseUrl && <button
+            className="btn btn-sm btn-primary"
+            disabled={busy}
+            onClick={async () => {
+              setBusy(true);
+              await onUseUrl?.(d.suggestion!.baseUrl);
+              setBusy(false);
+            }}
+          >
+            {busy ? <Spinner size={13} /> : <Link2 size={13} />} Usar {d.suggestion.baseUrl}
+          </button>}
+        </div>
+      )}
+      {d.ok && <OkNote>Todo en orden: {d.online} de {d.cameras} cámaras con video. Las imágenes aparecen en el Video en vivo.</OkNote>}
+      {d.snapshotTemplate && (
+        <div className="text-xs text-muted">
+          URL de imagen en uso: <code className="font-mono text-ink-2 break-all">{d.snapshotTemplate}</code>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DetectView({ d }: { d: Detection }) {
+  return (
+    <div className="space-y-3">
+      {d.applied ? (
+        <OkNote>
+          Guardado en el servidor. Imagen: <code className="font-mono break-all">{d.snapshot ?? "—"}</code>
+          {d.live ? (
+            <>
+              {" "}
+              · Stream: <code className="font-mono break-all">{d.live}</code>
+            </>
+          ) : (
+            " · Sin stream MJPEG: el video se arma con imágenes sucesivas."
+          )}
+        </OkNote>
+      ) : d.snapshot ? (
+        <OkNote>
+          Funciona: <code className="font-mono break-all">{d.snapshot}</code>. Un administrador debe pulsar "Detectar video" para guardarla.
+        </OkNote>
+      ) : (
+        <ErrorNote>Ninguna URL conocida devolvió imagen. Use "Probar" para ver en qué paso falla.</ErrorNote>
+      )}
+      <table className="w-full text-xs">
+        <tbody>
+          {d.tried.map((t, i) => (
+            <tr key={i} className="border-t border-line-soft">
+              <td className="py-1.5 pr-3 font-mono break-all text-ink-2">{t.template}</td>
+              <td className={`py-1.5 whitespace-nowrap ${t.result.startsWith("OK") ? "text-ok" : "text-muted"}`}>{t.result}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }
 

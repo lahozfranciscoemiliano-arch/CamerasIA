@@ -9,7 +9,7 @@ import { AuditService } from "../src/audit/service.js";
 import { KeyRing } from "../src/security/crypto.js";
 import { VaultService } from "../src/vault/service.js";
 import { compareGrids, lumaGrid, GRID_W, GRID_H } from "../src/detection/motion.js";
-import { ExacqSource, formatExacqTime, parseCameraList, parseClips } from "../src/exacq/client.js";
+import { describeNetworkError, ExacqSource, formatExacqTime, normalizeBaseUrl, parseCameraList, parseClips, parseServerOffset } from "../src/exacq/client.js";
 import { buildOpenfortivpnConfig, type VpnProfileRow } from "../src/vpn/manager.js";
 import { DemoSource } from "../src/exacq/demo.js";
 
@@ -83,6 +83,50 @@ test("parseo de respuestas exacqVision", () => {
   assert.deepEqual(clips, [{ start: "2026-01-01T10:00:05.000Z", end: "2026-01-01T10:01:00.000Z" }]);
   assert.equal(formatExacqTime(new Date("2026-01-01T13:00:00Z"), "America/Argentina/Buenos_Aires"), "2026-01-01T10:00:00-03:00");
   assert.equal(formatExacqTime(new Date("2026-07-01T12:00:00Z"), "Europe/Madrid"), "2026-07-01T14:00:00+02:00");
+  // Desfase numérico (horas) como lo informa config.web
+  assert.equal(formatExacqTime(new Date("2026-01-01T13:00:00.700Z"), -3), "2026-01-01T10:00:00-03:00");
+  assert.equal(formatExacqTime(new Date("2026-01-01T13:00:00Z"), 5.5), "2026-01-01T18:30:00+05:30");
+});
+
+test("parseo de config.web de exacqVision 23.09 (estado, deshabilitadas, nombres, zona)", () => {
+  const cfg = {
+    name: "BISTRO SA",
+    timezone: -3,
+    Cameras: [
+      { name: "ALMACEN PB", id: 1376768, state: 0, disabled: 0, formats: [4, 6] },
+      { name: " RECEPCION ", id: 1710080, state: 0, disabled: 0 },
+      { name: "OFICINA MARCOS", id: 4786176, state: 2, disabled: 1 },
+      { name: "", id: 4786944, state: 2, disabled: 1 },
+      { name: "SIN VIDEO", id: 5, state: 1, disabled: 0 },
+    ],
+    restricted: false,
+  };
+  assert.deepEqual(
+    parseCameraList(cfg).map((c) => [c.cameraId, c.name, c.online, c.disabled]),
+    [
+      ["1376768", "ALMACEN PB", true, false],
+      ["1710080", "RECEPCION", true, false],
+      ["4786176", "OFICINA MARCOS", false, true],
+      ["4786944", "Cámara 4786944", false, true],
+      ["5", "SIN VIDEO", false, false],
+    ],
+  );
+  assert.equal(parseServerOffset(cfg), -3);
+  assert.equal(parseServerOffset({ timezone: "x" }), null);
+});
+
+test("URL del Web Service: normalización y errores de red legibles", () => {
+  assert.equal(normalizeBaseUrl("192.168.109.58"), "http://192.168.109.58");
+  assert.equal(normalizeBaseUrl(" http://192.168.109.58/login.web "), "http://192.168.109.58");
+  assert.equal(normalizeBaseUrl("http://192.168.109.58/advanced.web#eyJzYiI6MX0="), "http://192.168.109.58");
+  assert.equal(normalizeBaseUrl("http://192.168.109.58:8080/v1/config.web?s=1"), "http://192.168.109.58:8080");
+  assert.equal(normalizeBaseUrl("https://nvr.empresa.local/exacq/"), "https://nvr.empresa.local/exacq");
+  const refused = Object.assign(new TypeError("fetch failed"), { cause: Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" }) });
+  assert.match(describeNetworkError(refused, "https://192.168.109.58"), /puerto 443.*http:\/\//);
+  assert.match(describeNetworkError(refused, "http://192.168.109.58:8080"), /puerto 8080/);
+  const tls = Object.assign(new TypeError("fetch failed"), { cause: Object.assign(new Error("self-signed"), { code: "DEPTH_ZERO_SELF_SIGNED_CERT" }) });
+  assert.match(describeNetworkError(tls, "https://192.168.109.58"), /HTTPS/);
+  assert.match(describeNetworkError(new DOMException("t", "TimeoutError"), "http://x"), /sin respuesta/);
 });
 
 test("cliente exacqVision contra un servidor simulado (login, re-login, cámaras, snapshot, búsqueda)", async () => {
@@ -127,18 +171,115 @@ test("cliente exacqVision contra un servidor simulado (login, re-login, cámaras
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
   const port = (server.address() as AddressInfo).port;
   try {
-    const src = new ExacqSource({ id: "s1", name: "Test", baseUrl: `http://127.0.0.1:${port}` }, () => ({ username: "viewer", password: "p&ss=word" }));
+    const adopted: Array<{ snapshot?: string; live?: string }> = [];
+    const src = new ExacqSource(
+      { id: "s1", name: "Test", baseUrl: `http://127.0.0.1:${port}` },
+      () => ({ username: "viewer", password: "p&ss=word" }),
+      undefined,
+      { onTemplates: (t) => adopted.push(t) },
+    );
     const cams = await src.listCameras();
     assert.deepEqual(cams.map((c) => c.name), ["Depósito"]);
     valid = "expirada"; // el servidor invalida la sesión → el cliente debe re-loguearse solo
+    // La plantilla por defecto (video.web&fmt=jpg) no existe en este servidor: el cliente
+    // prueba las candidatas, adopta image.web y avisa para guardarla.
     const snap = await src.snapshot("7");
     assert.equal(snap.contentType, "image/jpeg");
     assert.equal(sessions, 2);
+    assert.deepEqual(adopted, [{ snapshot: "/v1/image.web?s={session}&camera={camera}&quality={quality}" }]);
+    await src.snapshot("7");
+    assert.equal(adopted.length, 1);
     const clips = await src.searchRecordings("7", new Date("2026-01-01T09:00:00Z"), new Date("2026-01-01T11:00:00Z"));
     assert.equal(clips.length, 1);
     assert.equal(src.status().ok, true);
     const bad = new ExacqSource({ id: "s2", name: "Bad", baseUrl: `http://127.0.0.1:${port}` }, () => ({ username: "x", password: "y" }));
     await assert.rejects(bad.listCameras(), /rechazadas/);
+  } finally {
+    server.close();
+  }
+});
+
+test("exacqVision 23.09 simulado: diagnóstico completo y detección que guarda la plantilla", async () => {
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url!, "http://x");
+    if (url.pathname === "/") {
+      res.statusCode = 302;
+      res.setHeader("location", "/login.web");
+      return res.end();
+    }
+    if (url.pathname === "/v1/login.web") {
+      res.setHeader("content-type", "application/json");
+      return res.end(JSON.stringify({ success: true, sessionId: "abc" }));
+    }
+    if (url.searchParams.get("s") !== "abc") {
+      res.statusCode = 401;
+      return res.end();
+    }
+    if (url.pathname === "/v1/config.web") {
+      res.setHeader("content-type", "application/json");
+      return res.end(
+        JSON.stringify({
+          name: "BISTRO SA",
+          timezone: -3,
+          Cameras: [
+            { name: "OFICINA MARCOS", id: 4786176, state: 2, disabled: 1 },
+            { name: "ALMACEN PB", id: 1376768, state: 0, disabled: 0 },
+          ],
+        }),
+      );
+    }
+    if (url.pathname === "/v1/video.web" && url.searchParams.get("fmt") === "jpg" && url.searchParams.get("camera") === "1376768") {
+      res.setHeader("content-type", "image/jpeg");
+      return res.end(Buffer.from([0xff, 0xd8, 0xff, 0xd9]));
+    }
+    if (url.pathname === "/v1/video.web") {
+      res.statusCode = 400;
+      return res.end();
+    }
+    res.statusCode = 404;
+    res.setHeader("content-type", "text/plain; charset=utf-8");
+    res.end("Not found");
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as AddressInfo).port;
+  try {
+    const adopted: Array<{ snapshot?: string; live?: string }> = [];
+    const src = new ExacqSource(
+      // Plantilla vieja guardada que ya no existe en 23.09
+      { id: "s23", name: "Central", baseUrl: `http://127.0.0.1:${port}`, snapshotTemplate: "/v1/image.web?s={session}&camera={camera}&quality={quality}" },
+      () => ({ username: "admin", password: "x" }),
+      undefined,
+      { onTemplates: (t) => adopted.push(t) },
+    );
+    const d = await src.diagnose();
+    assert.deepEqual(
+      d.steps.map((s) => s.ok),
+      [true, true, true, true],
+      JSON.stringify(d.steps),
+    );
+    assert.equal(d.ok, true);
+    assert.equal(d.cameras, 2);
+    assert.equal(d.online, 1);
+    assert.equal(d.disabled, 1);
+    assert.match(d.steps[3]!.step, /ALMACEN PB/);
+    assert.equal(d.snapshotTemplate, "/v1/video.web?s={session}&camera={camera}&fmt=jpg");
+    assert.deepEqual(adopted, [{ snapshot: "/v1/video.web?s={session}&camera={camera}&fmt=jpg" }]);
+
+    const det = await src.detectTemplates("1376768");
+    assert.equal(det.snapshot, "/v1/video.web?s={session}&camera={camera}&fmt=jpg");
+    assert.equal(det.live, null);
+    assert.equal(det.applied, true);
+
+    // Servidor caído → mensaje con la causa, no "fetch failed"
+    const tmp = http.createServer();
+    await new Promise<void>((r) => tmp.listen(0, "127.0.0.1", r));
+    const closedPort = (tmp.address() as AddressInfo).port;
+    await new Promise<void>((r) => tmp.close(() => r()));
+    const down = new ExacqSource({ id: "x", name: "X", baseUrl: `http://127.0.0.1:${closedPort}` }, () => ({ username: "a", password: "b" }));
+    const dd = await down.diagnose();
+    assert.equal(dd.ok, false);
+    assert.equal(dd.steps.length, 1);
+    assert.match(dd.steps[0]!.detail, new RegExp(`rechazada en el puerto ${closedPort}`));
   } finally {
     server.close();
   }

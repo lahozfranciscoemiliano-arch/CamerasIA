@@ -8,19 +8,25 @@ CamerasIA habla con el **exacqVision Web Service** (el mismo componente que sirv
 |---|---|---|
 | Login | `POST /v1/login.web` (`u`, `p`, `responseVersion=2`, `s=0`) → `sessionId` | Verificado (uso real en proyectos de la comunidad) |
 | Logout | `POST /v1/logout.web?s=` | Verificado |
-| Cámaras | `GET /v1/config.web?s=&output=json` → `Cameras[]` | Verificado |
+| Cámaras | `GET /v1/config.web?s=&output=json` → `{ name, timezone, Cameras[] }` (cada cámara: `id`, `name`, `state`, `disabled`, …) | Verificado (23.09) |
 | Búsqueda de grabaciones | `GET /v1/search.web?s=&camera=&start=&end=&output=json` → `videoInfo[].clips[]` | Verificado |
 | Exportar clip MP4 | `GET /v1/export.web?s=&camera=&start=&end=&format=mp4&name=` → `export_id`; progreso `?export=ID`; descarga `&action=download`; cierre `&action=finish` | Verificado |
-| Imagen en vivo (snapshot) | Plantilla configurable | **Varía según versión** |
+| Imagen en vivo (snapshot) | `GET /v1/video.web?s=&camera=&fmt=jpg` por defecto; plantilla configurable | Verificado (23.09); **varía según versión** |
 | Stream MJPEG | Plantilla configurable (opcional) | **Varía según versión** |
 
-Las fechas se envían en ISO-8601 con la **zona horaria del servidor** (configúrela al agregar el servidor), igual que el cliente oficial.
+Las fechas se envían en ISO-8601 con la **zona horaria del servidor** (configúrela al agregar el servidor; si queda vacía se usa el desfase `timezone` que informa `config.web`), igual que el cliente oficial.
+
+**URL del servidor:** use la misma dirección con la que abre el cliente web de Exacq, normalmente `http://` (el Web Service no suele tener HTTPS). Si pega `192.168.109.58` o `http://192.168.109.58/login.web`, CamerasIA la normaliza a `http://192.168.109.58`.
+
+**Estado de las cámaras:** las que exacqVision informa con `disabled: 1` o `state` distinto de 0 figuran fuera de línea; las deshabilitadas en exacq se agregan desactivadas en CamerasIA.
 
 La sesión se renueva sola: si exacq la invalida (reinicio, expiración), CamerasIA vuelve a loguearse y reintenta.
 
 ## Imagen en vivo: detectar la URL correcta
 
-1. En *Administración → Servidores exacqVision* pulse **Detectar video**: CamerasIA prueba varias plantillas conocidas contra una cámara y guarda la que devuelve una imagen (`image/*`) o un stream `multipart/x-mixed-replace`.
+CamerasIA lo hace solo: si la URL de imagen en uso deja de devolver imágenes (404/400), prueba las plantillas conocidas (como máximo cada 10 minutos) y guarda la primera que funcione.
+
+1. En *Administración → Servidores exacqVision* pulse **Detectar video**: CamerasIA prueba varias plantillas conocidas contra una cámara con video y guarda (sólo Administrador) la que devuelve una imagen (`image/*`) o un stream `multipart/x-mixed-replace`.
 2. Si ninguna funciona, obténgala del cliente web oficial:
    - Abra `http://192.168.109.58` en Chrome, ingrese y abra una cámara en vivo.
    - Presione **F12 → Red (Network)**, filtre por `Img` o `.web`.
@@ -48,7 +54,7 @@ Cada cámara con **Detección** activa pide una imagen cada 2 segundos al Web Se
 
 ## Diagnóstico
 
-- **Probar**: hace login, lista cámaras y muestra latencia o el error exacto ("Credenciales rechazadas", "No se pudo contactar… ¿VPN conectada?").
+- **Probar**: diagnóstico paso a paso — conexión → inicio de sesión → cámaras → imagen en vivo — con el error exacto de cada paso ("conexión rechazada en el puerto 443…", "sin respuesta en 8 s (¿VPN conectada…?)", "Credenciales rechazadas"). Si `https://` no responde pero `http://` sí, ofrece cambiar la URL con un clic.
 - **JSON**: el Administrador ve la respuesta original de `config.web`; Tester ve las cámaras y la estructura tipada sin los demás valores de configuración.
 - Los errores de conexión aparecen también en el Tablero (Infraestructura) y en *Conectividad → Servidores de video*.
 

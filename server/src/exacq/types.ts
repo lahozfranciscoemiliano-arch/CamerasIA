@@ -2,6 +2,8 @@ export interface CameraInfo {
   cameraId: string;
   name: string;
   online: boolean;
+  /** Deshabilitada en el propio servidor de video (no se mostrará por defecto). */
+  disabled?: boolean;
   raw?: unknown;
 }
 

@@ -146,6 +146,17 @@ export class CameraService {
           });
           this.opts.onSourceStatus?.(srv.id, srv.name, st);
         },
+        {
+          // El cliente detectó URLs de video que funcionan: se guardan para los próximos reinicios.
+          onTemplates: (t) => {
+            this.db.run(
+              `UPDATE exacq_servers SET snapshot_template = COALESCE($snap, snapshot_template), live_template = COALESCE($live, live_template),
+               updated_at = $now WHERE id = $id`,
+              { snap: t.snapshot ?? null, live: t.live ?? null, now: Date.now(), id: srv.id },
+            );
+            this.opts.log(`exacqVision ${srv.name}: plantilla de video adoptada ${JSON.stringify(t)}`);
+          },
+        },
       );
       this.sources.set(srv.id, source);
     }
@@ -169,9 +180,10 @@ export class CameraService {
           const demoDefaults = src.kind === "demo" && ["1", "3", "7"].includes(c.cameraId);
           this.db.run(
             `INSERT INTO cameras(id, server_id, camera_id, name, enabled, motion_enabled, ai_verify, raw, online, last_seen_at, sort_order)
-             VALUES($id, $sid, $cid, $name, 1, $motion, 0, $raw, $online, $seen, $order)`,
+             VALUES($id, $sid, $cid, $name, $enabled, $motion, 0, $raw, $online, $seen, $order)`,
             {
               id,
+              enabled: !c.disabled,
               sid: src.id,
               cid: c.cameraId,
               name: c.name,
