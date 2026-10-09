@@ -350,3 +350,12 @@ test("simulador demo genera JPEG válidos y grabaciones", async () => {
   const clips = await demo.searchRecordings("3", new Date(Date.now() - 3 * 3600_000), new Date());
   assert.ok(clips.length > 0);
 });
+
+test("jpegSize lee las dimensiones del marcador SOF sin decodificar", async () => {
+  const { jpegSize } = await import("../src/video/jpeg.js");
+  const jpeg = (await import("jpeg-js")).default;
+  const img = jpeg.encode({ data: Buffer.alloc(320 * 180 * 4, 128), width: 320, height: 180 }, 70).data;
+  assert.deepEqual(jpegSize(img), { width: 320, height: 180 });
+  assert.equal(jpegSize(Buffer.from([0xff, 0xd8, 0xff, 0xd9])), null);
+  assert.equal(jpegSize(Buffer.from("no es jpeg")), null);
+});
