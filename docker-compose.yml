@@ -1,0 +1,21 @@
+services:
+  camerasia:
+    build: .
+    image: camerasia:latest
+    container_name: camerasia
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8443:8443"
+    volumes:
+      - camerasia-data:/data
+      - ./certs:/certs:ro
+    # Necesario SOLO si este servidor levanta el túnel FortiVPN (openfortivpn/pppd).
+    # Si el centro corre dentro de la LAN (acceso directo a 192.168.109.x), puede quitar estas dos secciones.
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/ppp:/dev/ppp
+
+volumes:
+  camerasia-data:

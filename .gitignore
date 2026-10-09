@@ -1,0 +1,11 @@
+node_modules/
+dist/
+data/
+*.log
+.env
+.env.*
+!.env.example
+certs/*.pem
+certs/*.key
+coverage/
+.DS_Store
