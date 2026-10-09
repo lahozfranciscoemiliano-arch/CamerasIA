@@ -1,0 +1,8 @@
+# Necesario SOLO si este servidor levanta el túnel FortiVPN (openfortivpn/pppd).
+# Requiere /dev/ppp en el host (VPS KVM/dedicado; no disponible en OpenVZ/LXC).
+services:
+  camerasia:
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/ppp:/dev/ppp

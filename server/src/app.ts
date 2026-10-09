@@ -48,7 +48,9 @@ export async function buildApp(cfg: AppConfig, opts: { logger?: boolean } = {}):
 
   const app = Fastify({
     logger: opts.logger === false ? false : { level: cfg.LOG_LEVEL, redact: ["req.headers.cookie", "req.headers.authorization", "req.headers['x-api-key']"] },
-    trustProxy: cfg.TRUST_PROXY,
+    // Detrás de un proxy (Caddy, FortiGate) se confía sólo en saltos de redes privadas/loopback,
+    // para que nadie pueda falsificar su IP con X-Forwarded-For desde Internet.
+    trustProxy: cfg.TRUST_PROXY ? "loopback, linklocal, uniquelocal" : false,
     bodyLimit: 1024 * 1024,
     ...(cfg.tls ? { https: { key: fs.readFileSync(cfg.TLS_KEY_FILE!), cert: fs.readFileSync(cfg.TLS_CERT_FILE!) } } : {}),
   }) as unknown as FastifyInstance;

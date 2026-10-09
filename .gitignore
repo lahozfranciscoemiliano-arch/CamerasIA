@@ -9,3 +9,7 @@ certs/*.pem
 certs/*.key
 coverage/
 .DS_Store
+
+# Despliegue
+deploy/Caddyfile
+backups/

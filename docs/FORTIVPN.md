@@ -37,7 +37,7 @@ No soportado por openfortivpn: login SAML/SSO y aprobación *push* de FortiToken
 
 openfortivpn usa `pppd`, que necesita privilegios de red:
 
-- **Docker** (imagen incluida): `cap_add: [NET_ADMIN]` y `devices: ["/dev/ppp:/dev/ppp"]` (ya están en `docker-compose.yml`). El proceso corre como usuario `cia` sin privilegios y sólo puede ejecutar `openfortivpn` vía `sudo` (`VPN_USE_SUDO=true`). Si el host no tiene `/dev/ppp`: `sudo modprobe ppp_generic`.
+- **Docker** (imagen incluida): `cap_add: [NET_ADMIN]` y `devices: ["/dev/ppp:/dev/ppp"]`, definidos en `docker-compose.vpn.yml` (actívelo con `COMPOSE_FILE=docker-compose.yml:docker-compose.vpn.yml` en `.env`; `scripts/install-vps.sh` lo hace solo si la VPS tiene `/dev/ppp`). El proceso corre como usuario `cia` sin privilegios y sólo puede ejecutar `openfortivpn` vía `sudo` (`VPN_USE_SUDO=true`). Si el host no tiene `/dev/ppp`: `sudo modprobe ppp_generic`.
 - **Instalación directa (Linux)**: `apt install openfortivpn ppp` y ejecute el servicio con un usuario que tenga permiso `sudo` sólo para `/usr/bin/openfortivpn`:
   ```
   camerasia ALL=(root) NOPASSWD: /usr/bin/openfortivpn

@@ -96,6 +96,24 @@ La opción **A** reduce la superficie de ataque (las credenciales de la VPN no s
 
 ---
 
+## Despliegue rápido en una VPS
+
+Desde su PC, con la carpeta del proyecto (instala Docker, HTTPS, FortiVPN, firewall y respaldos):
+
+```powershell
+# Windows (PowerShell)
+.\scripts\deploy.ps1 -Destino root@IP_DE_LA_VPS -Dominio soc.suempresa.com -Email usted@suempresa.com
+```
+
+```bash
+# Linux / macOS / WSL
+./scripts/deploy.sh root@IP_DE_LA_VPS --domain soc.suempresa.com --email usted@suempresa.com
+```
+
+Al terminar muestra la URL y la contraseña temporal de `admin`. Guía completa (sin dominio, restricción por IP, actualizar, respaldos): **[docs/DESPLIEGUE-VPS.md](docs/DESPLIEGUE-VPS.md)**.
+
+---
+
 ## Inicio rápido (modo DEMO)
 
 Con Node.js ≥ 22.13:
@@ -121,7 +139,12 @@ docker compose up -d --build
 docker compose logs camerasia | grep -A3 "administrador inicial"
 ```
 
-Abra `https://<servidor>:8443`. La imagen incluye `openfortivpn`; el `docker-compose.yml` otorga `NET_ADMIN` y `/dev/ppp` (sólo necesarios en el despliegue **B**).
+Abra `https://<servidor>:8443`. La imagen incluye `openfortivpn`. Para que el contenedor pueda levantar el túnel (despliegue **B**) agregue el overlay con `NET_ADMIN` y `/dev/ppp`:
+
+```bash
+echo "COMPOSE_FILE=docker-compose.yml:docker-compose.vpn.yml" >> .env
+docker compose up -d
+```
 
 ---
 
