@@ -49,5 +49,19 @@ Cada cámara con **Detección** activa pide una imagen cada 2 segundos al Web Se
 ## Diagnóstico
 
 - **Probar**: hace login, lista cámaras y muestra latencia o el error exacto ("Credenciales rechazadas", "No se pudo contactar… ¿VPN conectada?").
-- **JSON**: muestra la respuesta cruda de `config.web` para ver cómo su versión nombra los campos (nombre/estado de cámaras).
+- **JSON**: el Administrador ve la respuesta original de `config.web`; Tester ve las cámaras y la estructura tipada sin los demás valores de configuración.
 - Los errores de conexión aparecen también en el Tablero (Infraestructura) y en *Conectividad → Servidores de video*.
+
+### Diagnóstico desde la VPS con la credencial guardada
+
+Si el puerto TCP responde pero **Probar** vence a los 8 segundos, ejecute el siguiente diagnóstico desde el checkout de CamerasIA. No requiere reconstruir ni reiniciar la aplicación o la VPN:
+
+```bash
+cd /opt/camerasia
+git pull --ff-only
+docker exec -i camerasia node --disable-warning=ExperimentalWarning --input-type=module < scripts/diagnose-exacq.mjs
+```
+
+El script usa el contenedor actual y sus módulos compilados. Lee SQLite en modo de solo lectura, descifra en memoria la credencial asignada al servidor habilitado y prueba el login con un plazo de 30 segundos. Si obtiene una sesión, consulta el inventario y después cierra esa sesión de diagnóstico. Selecciona el único servidor habilitado o, si hay varios, el único cuyo nombre contiene `Bistro`; falla si la selección es ambigua.
+
+La salida incluye estado HTTP, tipo de respuesta, etapa, duración y cantidad de cámaras. No muestra contraseñas, clave maestra, sesión, cuerpo de respuesta ni nombres de cámaras. Mantiene la verificación TLS. Un fallo devuelve un código de salida distinto de cero; comparta únicamente la salida JSON para analizar si el problema está en autenticación, respuesta de la API o descubrimiento.
