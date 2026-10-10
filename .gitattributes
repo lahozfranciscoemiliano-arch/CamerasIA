@@ -1,0 +1,4 @@
+# Los scripts se ejecutan en Linux: forzar finales de línea LF aunque se clone en Windows.
+* text=auto eol=lf
+*.jpg binary
+*.png binary

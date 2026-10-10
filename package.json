@@ -1,0 +1,20 @@
+{
+  "name": "camerasia",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Centro de Monitoreo de Seguridad con IA (NOC/SOC) para exacqVision + FortiVPN",
+  "workspaces": [
+    "server",
+    "web"
+  ],
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "build": "npm run build -w web && npm run build -w server",
+    "start": "npm run start -w server",
+    "test": "npm test -w server && npm test -w web",
+    "typecheck": "npm run typecheck -w server && npm run typecheck -w web"
+  },
+  "engines": {
+    "node": ">=22.13"
+  }
+}

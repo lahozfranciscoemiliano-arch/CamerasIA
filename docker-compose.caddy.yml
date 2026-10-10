@@ -1,0 +1,20 @@
+# Proxy inverso con HTTPS automático. La configuración (deploy/Caddyfile) la genera scripts/install-vps.sh.
+services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: camerasia-caddy
+    restart: unless-stopped
+    depends_on:
+      - camerasia
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  caddy-data:
+  caddy-config:

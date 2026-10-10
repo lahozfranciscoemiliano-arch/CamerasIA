@@ -1,0 +1,21 @@
+# Servicio principal. Overlays opcionales (se combinan con COMPOSE_FILE en .env):
+#   docker-compose.vpn.yml   → privilegios para el túnel FortiVPN (NET_ADMIN + /dev/ppp)
+#   docker-compose.caddy.yml → Caddy delante con HTTPS automático (Let's Encrypt) — usado en VPS
+name: camerasia
+
+services:
+  camerasia:
+    build: .
+    image: camerasia:latest
+    container_name: camerasia
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      # En una VPS con Caddy el instalador fija APP_BIND=127.0.0.1 para no exponer el puerto interno.
+      - "${APP_BIND:-0.0.0.0}:${APP_PORT:-8443}:8443"
+    volumes:
+      - camerasia-data:/data
+      - ./certs:/certs:ro
+
+volumes:
+  camerasia-data:
