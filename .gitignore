@@ -13,3 +13,6 @@ coverage/
 # Despliegue
 deploy/Caddyfile
 backups/
+
+# Árboles de trabajo temporales de herramientas de desarrollo
+.claude/worktrees/
