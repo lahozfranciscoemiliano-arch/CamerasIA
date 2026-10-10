@@ -5,11 +5,37 @@ import type { FastifyInstance, FastifyRequest } from "fastify";
 import type { AppCtx } from "../context.js";
 import { HttpError, clientIp } from "../http/guards.js";
 import { sha256, safeEqual } from "../security/crypto.js";
-import { EVENT_STATUSES, EVENT_TYPES, SEVERITIES } from "./service.js";
+import { EVENT_STATUSES, EVENT_TYPES, SEVERITIES, type EventFilter } from "./service.js";
+import { AlertSettingsSchema } from "./settings.js";
 
 const StatusBody = z.object({ status: z.enum(EVENT_STATUSES) });
 const NoteBody = z.object({ text: z.string().min(1).max(2000) });
 const AssignBody = z.object({ assignee: z.string().max(64).nullable() });
+
+const FilterBody = z.object({
+  status: z.string().max(20).optional(),
+  severity: z.string().max(80).optional(),
+  type: z.string().max(400).optional(),
+  camera: z.string().max(120).optional(),
+  q: z.string().max(200).optional(),
+  since: z.number().int().optional(),
+  until: z.number().int().optional(),
+  category: z.enum(["security", "infra"]).optional(),
+  silent: z.boolean().optional(),
+});
+
+const BulkBody = z
+  .object({
+    status: z.enum(["ack", "resolved", "false_positive"]),
+    ids: z.array(z.number().int().positive()).min(1).max(1000).optional(),
+    filter: FilterBody.optional(),
+    dryRun: z.boolean().optional(),
+  })
+  .refine((b) => (b.ids === undefined) !== (b.filter === undefined), "Indique ids o filter (uno de los dos)");
+
+/** silent=0/1/true/false en la query → boolean (otro valor: sin filtro). */
+const boolParam = (v: string | undefined) => (v === "1" || v === "true" ? true : v === "0" || v === "false" ? false : undefined);
+const categoryParam = (v: string | undefined) => (v === "security" || v === "infra" ? v : undefined);
 
 const IngestBody = z.object({
   camera: z.string().max(120).optional().describe("id interno (srv:cam), id de cámara exacq o nombre"),
@@ -41,6 +67,8 @@ export function registerEventRoutes(app: FastifyInstance, ctx: AppCtx) {
       until: q.until ? Number(q.until) : undefined,
       limit: q.limit ? Number(q.limit) : undefined,
       before: q.before ? Number(q.before) : undefined,
+      silent: boolParam(q.silent),
+      category: categoryParam(q.category),
     });
   });
 
@@ -73,12 +101,45 @@ export function registerEventRoutes(app: FastifyInstance, ctx: AppCtx) {
     return ev;
   });
 
+  /** Compatibilidad: reconoce sólo los que siguen "nuevos" (no reabre eventos resueltos entretanto). */
   app.post("/api/events/ack-all", async (req) => {
     const a = guard(req, { role: "operator" });
     const body = z.object({ ids: z.array(z.number().int()).max(500) }).parse(req.body);
-    for (const id of body.ids) events.setStatus(id, "ack", a.user.username);
-    audit.log({ userId: a.user.id, username: a.user.username, action: "event.bulk_ack", ip: clientIp(req), details: { count: body.ids.length } });
-    return { ok: true, count: body.ids.length };
+    const r = events.bulkStatus({ ids: body.ids, status: "ack", user: a.user.username });
+    audit.log({ userId: a.user.id, username: a.user.username, action: "event.bulk_ack", ip: clientIp(req), details: { count: r.count } });
+    return { ok: true, count: r.count };
+  });
+
+  /** Cambio de estado masivo por selección (ids) o por "todo lo que coincide con el filtro". */
+  app.post("/api/events/bulk-status", async (req) => {
+    const a = guard(req, { role: "operator" });
+    const b = BulkBody.parse(req.body);
+    const filter: EventFilter | undefined = b.filter;
+    const r = events.bulkStatus({ ids: b.ids, filter, status: b.status, user: a.user.username, dryRun: b.dryRun });
+    if (!b.dryRun) {
+      audit.log({
+        userId: a.user.id,
+        username: a.user.username,
+        action: "event.bulk_status",
+        ip: clientIp(req),
+        details: { status: b.status, count: r.count, mode: b.ids ? "ids" : "filter", filter: b.filter },
+      });
+    }
+    return r;
+  });
+
+  // ───────── Política de alertas del servidor ─────────
+  app.get("/api/alerts/settings", async (req) => {
+    guard(req, { role: "tester" });
+    return ctx.alertSettings.get();
+  });
+
+  app.put("/api/alerts/settings", async (req) => {
+    const a = guard(req, { role: "admin" });
+    const body = AlertSettingsSchema.partial().strict().parse(req.body);
+    const saved = ctx.alertSettings.set(body);
+    audit.log({ userId: a.user.id, username: a.user.username, action: "alerts.settings", ip: clientIp(req), details: body });
+    return saved;
   });
 
   app.post<{ Params: { id: string } }>("/api/events/:id/assign", async (req) => {
@@ -143,7 +204,10 @@ export function registerEventRoutes(app: FastifyInstance, ctx: AppCtx) {
       : undefined;
     const snapshot = b.snapshot ? Buffer.from(b.snapshot.replace(/^data:image\/\w+;base64,/, ""), "base64") : null;
     if (snapshot && !(snapshot[0] === 0xff && snapshot[1] === 0xd8)) throw new HttpError(400, "snapshot debe ser un JPEG en base64");
-    const ev = events.create({
+    const dedupeSec = ctx.alertSettings.get().ingestDedupeSec;
+    const { ev, created } = events.upsert({
+      dedupeKey: dedupeSec > 0 ? `ext:${row.name}:${cam?.id ?? b.camera ?? ""}:${b.type}:${b.label ?? ""}` : undefined,
+      dedupeWindowMs: dedupeSec * 1000,
       ts: b.ts && Math.abs(b.ts - Date.now()) < 24 * 3600_000 ? b.ts : Date.now(),
       type: b.type,
       severity: b.severity ?? "medium",
@@ -154,8 +218,8 @@ export function registerEventRoutes(app: FastifyInstance, ctx: AppCtx) {
       snapshot,
       meta: { label: b.label, confidence: b.confidence, cameraRef: b.camera, ingestKey: row.name },
     });
-    if (b.verify && snapshot && ctx.ai.available()) void ctx.detection.verify(ev.id, { name: cam?.name ?? b.camera ?? "externa", zone: cam?.zone ?? null }, snapshot);
-    return { ok: true, id: ev.id };
+    if (created && b.verify && snapshot && ctx.ai.available()) void ctx.detection.verify(ev.id, { name: cam?.name ?? b.camera ?? "externa", zone: cam?.zone ?? null }, snapshot);
+    return { ok: true, id: ev.id, deduped: !created };
   });
 
   app.get("/api/ingest/keys", async (req) => {

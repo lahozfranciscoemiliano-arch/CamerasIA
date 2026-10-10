@@ -10,6 +10,7 @@ import {
   LogOut,
   Menu,
   MonitorPlay,
+  MoonStar,
   Network,
   Radar,
   Settings,
@@ -21,61 +22,97 @@ import { useEffect, useRef, useState } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { api } from "../lib/api";
 import { useAuth } from "../lib/auth";
-import { fmtDuration, ROLE_LABEL, SEVERITY_LABEL } from "../lib/format";
+import { useAlerts } from "../lib/alerts";
+import { fmtDuration, ROLE_LABEL } from "../lib/format";
 import { useLocalStorage, useNow } from "../lib/hooks";
 import { useRealtime, useTopic } from "../lib/realtime";
-import type { EventStats, SecEvent, Threat, VpnStatus } from "../lib/types";
-import { useToast } from "./toasts";
+import type { EventStats, Threat, VpnStatus } from "../lib/types";
 import { Dot } from "./ui";
 
 const THREAT_COLORS = ["", "var(--color-ok)", "var(--color-info)", "var(--color-warn)", "var(--color-serious)", "var(--color-crit)"];
 
-function beep(severity: string) {
-  try {
-    const ctx = new AudioContext();
-    const tones = severity === "critical" ? [880, 660, 880, 660] : [740, 990];
-    tones.forEach((f, i) => {
-      const o = ctx.createOscillator();
-      const g = ctx.createGain();
-      o.type = "square";
-      o.frequency.value = f;
-      g.gain.setValueAtTime(0.0001, ctx.currentTime + i * 0.18);
-      g.gain.exponentialRampToValueAtTime(0.08, ctx.currentTime + i * 0.18 + 0.02);
-      g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + i * 0.18 + 0.16);
-      o.connect(g).connect(ctx.destination);
-      o.start(ctx.currentTime + i * 0.18);
-      o.stop(ctx.currentTime + i * 0.18 + 0.17);
-    });
-    setTimeout(() => void ctx.close(), 1500);
-  } catch {
-    /* audio no disponible */
-  }
+/** Campana: sonido, "no molestar" y acceso a las preferencias de alertas de esta consola. */
+function AlertBell() {
+  const { prefs, setPrefs, dndUntil, setDnd } = useAlerts();
+  const navigate = useNavigate();
+  const now = useNow(30_000);
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const h = (e: PointerEvent) => !ref.current?.contains(e.target as Node) && setOpen(false);
+    window.addEventListener("pointerdown", h);
+    return () => window.removeEventListener("pointerdown", h);
+  }, [open]);
+  const dnd = dndUntil !== null && dndUntil > now;
+  const item = "w-full text-left px-3 py-1.5 text-sm rounded-md hover:bg-panel-3";
+  return (
+    <div className="relative" ref={ref}>
+      <button className="btn btn-ghost btn-sm" onClick={() => setOpen(!open)} title="Alertas de esta consola" aria-haspopup="menu" aria-expanded={open}>
+        {dnd ? <MoonStar size={16} className="text-info" /> : prefs.muted ? <BellOff size={16} className="text-muted" /> : <Bell size={16} />}
+        {dnd && <span className="hidden md:inline text-[11px] text-info">No molestar · {fmtDuration(dndUntil! - now)}</span>}
+      </button>
+      {open && (
+        <div role="menu" className="absolute right-0 top-full mt-2 z-50 w-64 panel p-2 space-y-1 shadow-xl">
+          <button className={item} onClick={() => setPrefs({ ...prefs, muted: !prefs.muted })}>
+            {prefs.muted ? "Activar sonidos" : "Silenciar sonidos"}
+          </button>
+          <div className="label !text-[10px] px-3 pt-2">No molestar</div>
+          {[
+            ["15 minutos", 15],
+            ["1 hora", 60],
+            ["4 horas", 240],
+          ].map(([label, min]) => (
+            <button key={label} className={item} onClick={() => (setDnd(min as number), setOpen(false))}>
+              {label}
+            </button>
+          ))}
+          <button className={item} onClick={() => (setDnd("morning"), setOpen(false))}>
+            Hasta las 07:00
+          </button>
+          {dnd && (
+            <button className={`${item} text-warn`} onClick={() => (setDnd(null), setOpen(false))}>
+              Desactivar
+            </button>
+          )}
+          <div className="border-t border-line-soft my-1" />
+          <button className={item} onClick={() => (setOpen(false), navigate("/perfil#alertas"))}>
+            Preferencias de alertas…
+          </button>
+        </div>
+      )}
+    </div>
+  );
 }
 
 export default function Layout() {
   const { me, logout, can } = useAuth();
   const { connected } = useRealtime();
-  const toast = useToast();
   const navigate = useNavigate();
   const location = useLocation();
   const now = useNow();
   const [collapsed, setCollapsed] = useLocalStorage("cia.sidebar.collapsed", false);
-  const [sound, setSound] = useLocalStorage("cia.alerts.sound", true);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [threat, setThreat] = useState<Threat | null>(null);
   const [openCount, setOpenCount] = useState(0);
   const [vpn, setVpn] = useState<VpnStatus | null>(null);
-  const soundRef = useRef(sound);
-  soundRef.current = sound;
 
   const loadStats = () =>
     api
       .get<EventStats>("/api/events/stats?hours=24")
       .then((s) => {
         setThreat(s.threat);
-        setOpenCount(s.open);
+        // El badge cuenta sólo lo que requiere atención (no silenciados, severidad media o más).
+        setOpenCount(s.openAlerting ?? s.open);
       })
       .catch(() => undefined);
+  // Ante ráfagas de eventos se recalcula una sola vez (1 s después del último).
+  const statsTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const scheduleStats = () => {
+    clearTimeout(statsTimer.current);
+    statsTimer.current = setTimeout(() => void loadStats(), 1000);
+  };
+  useEffect(() => () => clearTimeout(statsTimer.current), []);
 
   useEffect(() => {
     void loadStats();
@@ -87,19 +124,10 @@ export default function Layout() {
   useEffect(() => setMobileOpen(false), [location.pathname]);
 
   useTopic<VpnStatus>("vpn.status", setVpn);
-  useTopic<SecEvent>("event.update", () => void loadStats());
-  useTopic<SecEvent>("event.new", (ev) => {
-    void loadStats();
-    if (ev.severity === "high" || ev.severity === "critical") {
-      toast({
-        tone: "alert",
-        title: `${SEVERITY_LABEL[ev.severity]} · ${ev.title}`,
-        body: ev.cameraName ? `Cámara: ${ev.cameraName}` : ev.description ?? undefined,
-        onClick: () => navigate(`/eventos?id=${ev.id}`),
-      });
-      if (soundRef.current) beep(ev.severity);
-    }
-  });
+  // Los avisos (toasts y sonido) los decide AlertsProvider a partir de alert.notify; aquí sólo se refrescan contadores.
+  useTopic("event.new", scheduleStats);
+  useTopic("event.update", scheduleStats);
+  useTopic("event.bulk", scheduleStats);
 
   const nav = [
     { to: "/", label: "Tablero", icon: <LayoutDashboard size={18} />, end: true },
@@ -237,9 +265,7 @@ export default function Layout() {
             </span>
           </button>
           <div className="ml-auto flex items-center gap-3">
-            <button className="btn btn-ghost btn-sm" onClick={() => setSound(!sound)} title={sound ? "Silenciar alertas sonoras" : "Activar alertas sonoras"}>
-              {sound ? <Bell size={16} /> : <BellOff size={16} className="text-muted" />}
-            </button>
+            <AlertBell />
             <div className="hidden sm:flex items-center gap-2 text-xs">
               <Dot tone={connected ? "ok" : "crit"} pulse={connected} />
               <span className={`font-display font-bold tracking-[0.2em] ${connected ? "text-ok" : "text-crit"}`}>{connected ? "EN VIVO" : "SIN ENLACE"}</span>

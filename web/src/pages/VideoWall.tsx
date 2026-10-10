@@ -31,7 +31,7 @@ export default function VideoWall() {
   const list = useMemo(
     () =>
       (cameras ?? []).filter(
-        (c) => c.enabled && (!onlyOnline || c.online) && (!filter || `${c.name} ${c.zone ?? ""} ${c.serverName}`.toLowerCase().includes(filter.toLowerCase())),
+        (c) => c.enabled && !c.vmsDisabled && (!onlyOnline || c.online) && (!filter || `${c.name} ${c.zone ?? ""} ${c.serverName}`.toLowerCase().includes(filter.toLowerCase())),
       ),
     [cameras, filter, onlyOnline],
   );

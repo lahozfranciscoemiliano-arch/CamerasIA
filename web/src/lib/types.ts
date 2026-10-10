@@ -38,6 +38,11 @@ export interface Camera {
   online: boolean;
   lastSeenAt: number | null;
   sortOrder: number;
+  /** Deshabilitada en el propio exacqVision (no alerta ni cuenta). */
+  vmsDisabled?: boolean;
+  /** Alertas silenciadas hasta este instante (null = activas). */
+  alertsMutedUntil?: number | null;
+  offlineSince?: number | null;
 }
 
 export interface VisionResult {
@@ -75,6 +80,83 @@ export interface SecEvent {
   resolvedAt: number | null;
   meta: Record<string, unknown> | null;
   notes?: Array<{ id: number; username: string; ts: number; text: string }>;
+  /** Veces que se repitió (deduplicación). */
+  occurrences?: number;
+  lastTs?: number;
+  /** Registrado sin avisar (cámara silenciada, microcorte, etc.). */
+  silent?: boolean;
+  notifiedAt?: number | null;
+  category?: AlertCategory;
+}
+
+export type AlertCategory = "security" | "infra";
+
+export interface NoticeItem {
+  eventId: number;
+  severity: Severity;
+  category: AlertCategory;
+  type: string;
+  title: string;
+  cameraName: string | null;
+  reason: "new" | "escalated" | "recovered";
+}
+
+/** Aviso del servidor (tópico alert.notify); cada consola decide si lo muestra o suena. */
+export interface AlertNotice {
+  id: string;
+  ts: number;
+  kind: "event" | "escalation" | "recovery" | "digest";
+  severity: Severity;
+  category: AlertCategory | "mixed";
+  title: string;
+  body?: string;
+  eventId?: number;
+  cameraId?: string | null;
+  count: number;
+  items: NoticeItem[];
+}
+
+export type AlertThreshold = Severity | "off";
+
+/** Preferencias de alertas de ESTA consola (localStorage). */
+export interface AlertPrefs {
+  security: { toast: AlertThreshold; sound: AlertThreshold };
+  infra: { toast: AlertThreshold; sound: AlertThreshold };
+  recoveries: boolean;
+  soundCooldownSec: number;
+  maxToasts: number;
+  dndAllowCritical: boolean;
+  /** "No molestar" hasta este instante. */
+  dndUntil: number | null;
+  /** Silencio total de sonidos (botón de la campana). */
+  muted: boolean;
+}
+
+/** Política de alertas del servidor (Administración → Alertas). */
+export interface AlertSettings {
+  cameraOfflineAfterSec: number;
+  cameraOfflineMinSyncs: number;
+  groupMinCameras: number;
+  sourceDownAfterSec: number;
+  sourceDownMinSyncs: number;
+  sourceCriticalAfterMin: number;
+  vpnDownGraceSec: number;
+  vpnCriticalAfterMin: number;
+  hostDownAfterChecks: number;
+  hostUpAfterChecks: number;
+  hostProbeRetryMs: number;
+  reopenWindowMin: number;
+  flapThreshold: number;
+  motionDedupeMin: number;
+  aiReverifyMin: number;
+  tamperConfirmFrames: number;
+  tamperGlobalCameras: number;
+  tamperGlobalWindowSec: number;
+  tamperDedupeMin: number;
+  ingestDedupeSec: number;
+  notifyCoalesceMs: number;
+  maxNotificationsPerMin: number;
+  notifyMinSeverity: Severity;
 }
 
 export interface EventStats {
@@ -83,6 +165,10 @@ export interface EventStats {
   total: number;
   open: number;
   openCritical: number;
+  /** Abiertos que requieren atención (no silenciados, severidad media o más). */
+  openAlerting?: number;
+  openSecurity?: number;
+  openInfra?: number;
   mttaMs: number | null;
   aiVerified: number;
   bySeverity: Partial<Record<Severity, number>>;
@@ -144,6 +230,9 @@ export interface Host {
   checkedAt: number | null;
   changedAt: number | null;
   simulated: boolean;
+  probeOk?: boolean | null;
+  /** Falló algún chequeo reciente pero todavía no se confirmó la caída. */
+  unstable?: boolean;
 }
 
 export interface SystemInfo {
@@ -175,7 +264,7 @@ export interface Dashboard {
   demo: boolean;
   threat: Threat;
   stats: EventStats;
-  cameras: { total: number; online: number; offline: Array<{ id: string; name: string }>; detection: number; aiVerify: number };
+  cameras: { total: number; online: number; offline: Array<{ id: string; name: string }>; detection: number; aiVerify: number; vmsDisabled?: number };
   sources: SourceStatus[];
   vpn: VpnStatus;
   hosts: Host[];

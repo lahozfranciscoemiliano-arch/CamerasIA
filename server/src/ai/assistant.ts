@@ -88,7 +88,7 @@ export class Assistant {
         description: "Resumen del estado actual: nivel de amenaza, eventos abiertos, cámaras online/offline, túnel VPN y equipos caídos.",
         inputSchema: z.object({}),
         run: wrap("get_system_status", async () => {
-          const cams = d.cameras.list();
+          const cams = d.cameras.list().filter((c) => c.enabled);
           const stats = d.events.stats(24);
           const vpn = d.vpn.status();
           const hosts = d.health.list().map(publicHost);
@@ -320,7 +320,7 @@ export class Assistant {
     const stats = this.d.events.stats(opts.hours);
     const relevant = this.d.events.list({ since, severity: "medium,high,critical", limit: 150 });
     const fmt = (ts: number) => new Date(ts).toLocaleString("es-AR", { hour12: false });
-    const cams = this.d.cameras.list();
+    const cams = this.d.cameras.list().filter((c) => c.enabled);
     const vpn = this.d.vpn.status();
     const data = {
       periodo: { desde: fmt(since), hasta: fmt(Date.now()), horas: opts.hours },

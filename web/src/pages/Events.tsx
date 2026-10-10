@@ -1,19 +1,30 @@
 import { AnimatePresence, motion } from "framer-motion";
-import { CheckCheck, CheckCircle2, Download, Eye, FileSearch, Filter, MessageSquare, RefreshCw, Search, Siren, Sparkles, UserCheck, X, XCircle } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { BellOff, CheckCheck, CheckCircle2, Download, Eye, FileSearch, Filter, MessageSquare, RefreshCw, Search, Siren, Sparkles, UserCheck, X, XCircle } from "lucide-react";
+import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { AiResultCard } from "../components/CameraTile";
 import { EventItem } from "../components/EventItem";
 import { useToast } from "../components/toasts";
-import { Empty, ErrorNote, PageHeader, Panel, SeverityBadge, Spinner, StatusBadge } from "../components/ui";
+import { Empty, ErrorNote, PageHeader, Panel, SeverityBadge, Spinner, StatusBadge, Toggle } from "../components/ui";
 import { api, ApiError } from "../lib/api";
 import { useAuth } from "../lib/auth";
-import { fmtDateTime, SEVERITY_LABEL, STATUS_LABEL, TYPE_LABEL } from "../lib/format";
-import { useApi } from "../lib/hooks";
+import { CATEGORY_LABEL, fmtAgo, fmtDateTime, SEVERITY_LABEL, STATUS_LABEL, TYPE_LABEL } from "../lib/format";
+import { useApi, useLocalStorage } from "../lib/hooks";
 import { useTopic } from "../lib/realtime";
-import type { Camera, EventStatus, SecEvent, Severity } from "../lib/types";
+import type { AlertCategory, Camera, EventStatus, SecEvent, Severity } from "../lib/types";
 
 const SEVS: Severity[] = ["critical", "high", "medium", "low", "info"];
+const MEDIUM_UP: Severity[] = ["critical", "high", "medium"];
+const OPEN_STATUSES: EventStatus[] = ["new", "ack", "investigating"];
+type BulkStatus = "ack" | "resolved" | "false_positive";
+
+const MUTE_OPTIONS: Array<{ label: string; minutes: number | null; forever?: boolean }> = [
+  { label: "1 hora", minutes: 60 },
+  { label: "8 horas", minutes: 480 },
+  { label: "24 horas", minutes: 1440 },
+  { label: "7 días", minutes: 10_080 },
+  { label: "Siempre", minutes: null, forever: true },
+];
 
 function csvEscape(v: unknown) {
   const s = String(v ?? "");
@@ -30,33 +41,145 @@ export default function Events() {
   const [camera, setCamera] = useState("");
   const [q, setQ] = useState("");
   const [hours, setHours] = useState(24);
+  const [category, setCategory] = useState<AlertCategory | "">("");
+  const [hideSilent, setHideSilent] = useLocalStorage("cia.events.hideSilent", true);
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [pending, setPending] = useState(0);
+  const [busy, setBusy] = useState(false);
+  const lastChecked = useRef<number | null>(null);
   const { data: cameras } = useApi<Camera[]>("/api/cameras");
 
+  // Filtro común a la lista y a "reconocer todo lo filtrado" (bulk-status por filtro).
+  const filter = useMemo(() => {
+    const f: Record<string, string | number | boolean> = { since: Date.now() - hours * 3600_000 };
+    if (status) f.status = status;
+    if (sev.length) f.severity = sev.join(",");
+    if (type) f.type = type;
+    if (camera) f.camera = camera;
+    if (q) f.q = q;
+    if (category) f.category = category;
+    if (hideSilent) f.silent = false;
+    return f;
+  }, [status, sev, type, camera, q, hours, category, hideSilent]);
   const query = useMemo(() => {
-    const p = new URLSearchParams({ limit: "300", since: String(Date.now() - hours * 3600_000) });
-    if (status) p.set("status", status);
-    if (sev.length) p.set("severity", sev.join(","));
-    if (type) p.set("type", type);
-    if (camera) p.set("camera", camera);
-    if (q) p.set("q", q);
+    const p = new URLSearchParams({ limit: "300" });
+    for (const [k, v] of Object.entries(filter)) p.set(k, k === "silent" ? (v ? "1" : "0") : String(v));
     return `/api/events?${p}`;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [status, sev, type, camera, q, hours]);
+  }, [filter]);
   const { data: events, setData, loading, reload } = useApi<SecEvent[]>(query);
   const selectedId = params.get("id") ? Number(params.get("id")) : null;
 
+  useEffect(() => {
+    setSelected(new Set());
+    setPending(0);
+  }, [query]);
+
+  const matches = (ev: SecEvent) =>
+    (!sev.length || sev.includes(ev.severity)) &&
+    (!camera || ev.cameraId === camera) &&
+    (!type || ev.type === type) &&
+    (!status || (status === "open" ? OPEN_STATUSES.includes(ev.status) : status === ev.status)) &&
+    (!category || ev.category === category) &&
+    (!hideSilent || !ev.silent) &&
+    (!q || `${ev.title} ${ev.description ?? ""}`.toLowerCase().includes(q.toLowerCase()));
+
   useTopic<SecEvent>("event.new", (ev) => {
-    if ((!sev.length || sev.includes(ev.severity)) && (!camera || ev.cameraId === camera) && (!type || ev.type === type) && (!status || status === "open" || status === ev.status))
-      setData((cur) => (cur ? [ev, ...cur] : cur));
+    if (!matches(ev)) return;
+    // Con filas seleccionadas no se mueve la lista: se ofrece actualizar.
+    if (selected.size) setPending((n) => n + 1);
+    else setData((cur) => (cur ? [ev, ...cur] : cur));
   });
   useTopic<SecEvent>("event.update", (ev) => setData((cur) => cur?.map((e) => (e.id === ev.id ? { ...e, ...ev } : e)) ?? cur));
+  useTopic<{ ids: number[]; status: EventStatus; by: string; at: number }>("event.bulk", (b) => {
+    const ids = new Set(b.ids);
+    setData(
+      (cur) =>
+        cur?.map((e) =>
+          ids.has(e.id)
+            ? {
+                ...e,
+                status: b.status,
+                ackBy: e.ackBy ?? b.by,
+                ackAt: e.ackAt ?? b.at,
+                ...(b.status === "ack" ? {} : { resolvedBy: b.by, resolvedAt: b.at }),
+              }
+            : e,
+        ) ?? cur,
+    );
+  });
 
-  const openNew = (events ?? []).filter((e) => e.status === "new");
+  const list = events ?? [];
+  const openNew = list.filter((e) => e.status === "new");
+  const selectedEvents = list.filter((e) => selected.has(e.id));
+  const sharedCamera = selectedEvents.length && selectedEvents.every((e) => e.cameraId && e.cameraId === selectedEvents[0]!.cameraId) ? selectedEvents[0]!.cameraId : null;
+
+  const toggle = (ev: SecEvent, checked: boolean, e: MouseEvent) => {
+    setSelected((cur) => {
+      const next = new Set(cur);
+      // Shift+clic: selecciona el rango desde la última casilla tocada.
+      if (e.shiftKey && lastChecked.current !== null) {
+        const a = list.findIndex((x) => x.id === lastChecked.current);
+        const b = list.findIndex((x) => x.id === ev.id);
+        if (a >= 0 && b >= 0) for (const x of list.slice(Math.min(a, b), Math.max(a, b) + 1)) checked ? next.add(x.id) : next.delete(x.id);
+      } else if (checked) next.add(ev.id);
+      else next.delete(ev.id);
+      return next;
+    });
+    lastChecked.current = ev.id;
+  };
+
+  const runBulk = async (status: BulkStatus, ids: number[]) => {
+    setBusy(true);
+    try {
+      const r = await api.post<{ count: number }>("/api/events/bulk-status", { status, ids });
+      toast({ tone: "ok", title: `${r.count} eventos marcados como "${STATUS_LABEL[status]}"` });
+      setSelected(new Set());
+    } catch (e) {
+      toast({ tone: "error", title: (e as ApiError).message });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const ackFiltered = async () => {
+    const body = { status: "ack", filter: { ...filter, status: "new" } };
+    try {
+      const dry = await api.post<{ count: number }>("/api/events/bulk-status", { ...body, dryRun: true });
+      if (!dry.count) return toast({ tone: "info", title: "No hay eventos nuevos con estos filtros" });
+      if (!confirm(`¿Reconocer ${dry.count} eventos nuevos que coinciden con los filtros${dry.count >= 5000 ? " (máximo 5000 por vez)" : ""}?`)) return;
+      const r = await api.post<{ count: number }>("/api/events/bulk-status", body);
+      toast({ tone: "ok", title: `${r.count} eventos reconocidos` });
+    } catch (e) {
+      toast({ tone: "error", title: (e as ApiError).message });
+    }
+  };
+
+  const muteCamera = async (cameraId: string, minutes: number) => {
+    try {
+      await api.post(`/api/cameras/${encodeURIComponent(cameraId)}/mute`, { minutes });
+      toast({ tone: "ok", title: "Alertas de la cámara silenciadas", body: `Durante ${minutes / 60} h` });
+      setSelected(new Set());
+    } catch (e) {
+      toast({ tone: "error", title: (e as ApiError).message });
+    }
+  };
 
   const exportCsv = () => {
-    const rows = [["id", "fecha", "tipo", "severidad", "estado", "camara", "titulo", "descripcion", "ia_resumen", "atendido_por"]];
-    for (const e of events ?? [])
-      rows.push([String(e.id), fmtDateTime(e.ts), TYPE_LABEL[e.type] ?? e.type, SEVERITY_LABEL[e.severity], STATUS_LABEL[e.status], e.cameraName ?? "", e.title, e.description ?? "", e.ai?.summary ?? "", e.ackBy ?? ""]);
+    const rows = [["id", "fecha", "tipo", "severidad", "estado", "camara", "titulo", "descripcion", "ia_resumen", "atendido_por", "ocurrencias"]];
+    for (const e of list)
+      rows.push([
+        String(e.id),
+        fmtDateTime(e.ts),
+        TYPE_LABEL[e.type] ?? e.type,
+        SEVERITY_LABEL[e.severity],
+        STATUS_LABEL[e.status],
+        e.cameraName ?? "",
+        e.title,
+        e.description ?? "",
+        e.ai?.summary ?? "",
+        e.ackBy ?? "",
+        String(e.occurrences ?? 1),
+      ]);
     const blob = new Blob(["﻿" + rows.map((r) => r.map(csvEscape).join(";")).join("\n")], { type: "text/csv;charset=utf-8" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
@@ -64,11 +187,9 @@ export default function Events() {
     a.click();
   };
 
-  const ackAll = async () => {
-    await api.post("/api/events/ack-all", { ids: openNew.map((e) => e.id) });
-    toast({ tone: "ok", title: `${openNew.length} eventos reconocidos` });
-    void reload();
-  };
+  const operator = can("operator");
+  const mediumUp = MEDIUM_UP.every((s) => sev.includes(s)) && sev.length === MEDIUM_UP.length;
+  const chip = (active: boolean) => `rounded-full border px-2.5 py-1 text-xs transition-colors ${active ? "border-accent/60 bg-accent/10 text-accent" : "border-line text-ink-2 hover:text-ink"}`;
 
   return (
     <div className="space-y-4">
@@ -78,12 +199,12 @@ export default function Events() {
         icon={<Siren size={20} />}
         actions={
           <>
-            {can("operator") && openNew.length > 0 && (
-              <button className="btn btn-sm" onClick={() => void ackAll()}>
-                <CheckCheck size={14} /> Reconocer {openNew.length} nuevos
+            {operator && openNew.length > 0 && (
+              <button className="btn btn-sm" onClick={() => void ackFiltered()} title="Reconoce todos los eventos nuevos que coinciden con los filtros (no sólo los cargados)">
+                <CheckCheck size={14} /> Reconocer todo lo filtrado
               </button>
             )}
-            <button className="btn btn-sm" onClick={exportCsv} disabled={!events?.length}>
+            <button className="btn btn-sm" onClick={exportCsv} disabled={!list.length}>
               <Download size={14} /> CSV
             </button>
             <button className="btn btn-sm" onClick={() => void reload()}>
@@ -93,7 +214,7 @@ export default function Events() {
         }
       />
 
-      <Panel bodyClass="p-3">
+      <Panel bodyClass="p-3 space-y-2">
         <div className="flex flex-wrap items-center gap-2">
           <Filter size={15} className="text-muted" />
           <div className="relative">
@@ -140,13 +261,66 @@ export default function Events() {
             ))}
           </div>
         </div>
+        <div className="flex flex-wrap items-center gap-2">
+          {(["security", "infra"] as AlertCategory[]).map((c) => (
+            <button key={c} className={chip(category === c)} onClick={() => setCategory(category === c ? "" : c)}>
+              {CATEGORY_LABEL[c]}
+            </button>
+          ))}
+          <button className={chip(mediumUp)} onClick={() => setSev(mediumUp ? [] : MEDIUM_UP)}>
+            ≥ Media
+          </button>
+          <div className="ml-auto">
+            <Toggle checked={hideSilent} onChange={setHideSilent} label="Ocultar silenciados" />
+          </div>
+        </div>
       </Panel>
 
+      {operator && selected.size > 0 && (
+        <div className="sticky top-0 z-20 panel px-3 py-2 flex flex-wrap items-center gap-2">
+          <span className="text-sm font-semibold mr-2">{selected.size} seleccionados</span>
+          <button className="btn btn-sm" disabled={busy} onClick={() => void runBulk("ack", [...selected])}>
+            <Eye size={14} /> Reconocer ({selected.size})
+          </button>
+          <button className="btn btn-sm" disabled={busy} onClick={() => void runBulk("resolved", [...selected])}>
+            <CheckCircle2 size={14} className="text-ok" /> Resolver ({selected.size})
+          </button>
+          <button className="btn btn-sm" disabled={busy} onClick={() => void runBulk("false_positive", [...selected])}>
+            <XCircle size={14} className="text-muted" /> Falsa alarma ({selected.size})
+          </button>
+          {sharedCamera && (
+            <button className="btn btn-sm" disabled={busy} onClick={() => void muteCamera(sharedCamera, 60)}>
+              <BellOff size={14} /> Silenciar cámara 1 h
+            </button>
+          )}
+          <button className="btn btn-sm btn-ghost ml-auto" onClick={() => setSelected(new Set())}>
+            Limpiar
+          </button>
+        </div>
+      )}
+
+      {pending > 0 && (
+        <button className="w-full rounded-lg border border-accent/40 bg-accent/10 py-1.5 text-sm text-accent" onClick={() => (setPending(0), void reload())}>
+          {pending} nuevos · actualizar
+        </button>
+      )}
+
       <div className="space-y-2">
-        {loading && !events && <div className="grid place-items-center py-10"><Spinner /></div>}
+        {loading && !events && (
+          <div className="grid place-items-center py-10">
+            <Spinner />
+          </div>
+        )}
         <AnimatePresence initial={false}>
-          {events?.map((ev) => (
-            <EventItem key={ev.id} ev={ev} onClick={() => setParams({ ...Object.fromEntries(params), id: String(ev.id) })} />
+          {list.map((ev) => (
+            <EventItem
+              key={ev.id}
+              ev={ev}
+              selectable={operator}
+              checked={selected.has(ev.id)}
+              onCheck={(checked, e) => toggle(ev, checked, e)}
+              onClick={() => setParams({ ...Object.fromEntries(params), id: String(ev.id) })}
+            />
           ))}
         </AnimatePresence>
         {events && !events.length && <Empty icon={<FileSearch size={28} />} title="Sin eventos para los filtros elegidos" />}
@@ -200,6 +374,14 @@ function EventDrawer({ id, onClose }: { id: number; onClose: () => void }) {
 
   const setStatus = (status: EventStatus) => act(() => api.post(`/api/events/${id}/status`, { status }), `Evento marcado como "${STATUS_LABEL[status]}"`);
   const box = ev?.meta?.box as { x: number; y: number; w: number; h: number } | undefined;
+  const group = ev?.meta?.group === true ? ((ev.meta.cameras as Array<{ id: string; name: string }>) ?? []) : null;
+  const recoveredIds = new Set(((ev?.meta?.recovered as Array<{ id: string }> | undefined) ?? []).map((r) => r.id));
+  const mute = (opt: (typeof MUTE_OPTIONS)[number] | null) =>
+    ev?.cameraId &&
+    act(
+      () => api.post(`/api/cameras/${encodeURIComponent(ev.cameraId!)}/mute`, opt ? { minutes: opt.minutes, forever: opt.forever } : { minutes: null }),
+      opt ? `Alertas de ${ev.cameraName ?? "la cámara"} silenciadas (${opt.label.toLowerCase()})` : "Alertas de la cámara reactivadas",
+    );
 
   return (
     <>
@@ -232,7 +414,35 @@ function EventDrawer({ id, onClose }: { id: number; onClose: () => void }) {
                 <span>Origen: {ev.source}</span>
               </div>
               {ev.description && <p className="text-sm text-ink-2 mt-2">{ev.description}</p>}
+              {((ev.occurrences ?? 1) > 1 || ev.silent || ev.meta?.flapping === true) && (
+                <div className="mt-2 flex flex-wrap gap-2 text-xs">
+                  {(ev.occurrences ?? 1) > 1 && (
+                    <span className="rounded-full border border-line px-2 py-0.5 text-ink-2">
+                      Se repitió {ev.occurrences} veces · última {fmtAgo(ev.lastTs ?? ev.ts)}
+                    </span>
+                  )}
+                  {ev.meta?.flapping === true && <span className="rounded-full border border-warn/50 px-2 py-0.5 text-warn">Inestable: se cae y vuelve</span>}
+                  {ev.silent && (
+                    <span className="rounded-full border border-line px-2 py-0.5 text-muted flex items-center gap-1">
+                      <BellOff size={11} /> Silenciado (sin aviso)
+                    </span>
+                  )}
+                </div>
+              )}
             </div>
+
+            {group && (
+              <Panel title={`Cámaras afectadas (${group.length})`} bodyClass="p-3">
+                <ul className="grid grid-cols-1 sm:grid-cols-2 gap-1 text-sm">
+                  {group.map((c) => (
+                    <li key={c.id} className={`flex items-center gap-2 ${recoveredIds.has(c.id) ? "text-ok" : "text-ink-2"}`}>
+                      {recoveredIds.has(c.id) ? <CheckCircle2 size={13} /> : <XCircle size={13} className="text-crit" />}
+                      <span className="truncate">{c.name}</span>
+                    </li>
+                  ))}
+                </ul>
+              </Panel>
+            )}
 
             {ev.hasSnapshot && (
               <div className="relative rounded-lg overflow-hidden border border-line">
@@ -275,6 +485,31 @@ function EventDrawer({ id, onClose }: { id: number; onClose: () => void }) {
                 <button className="btn col-span-2" disabled={busy} onClick={() => void act(() => api.post(`/api/events/${id}/assign`, { assignee: ev.assignedTo === me?.user.username ? null : me?.user.username }), "Asignación actualizada")}>
                   <UserCheck size={14} /> {ev.assignedTo === me?.user.username ? "Liberar asignación" : "Asignarme este evento"}
                 </button>
+              </div>
+            )}
+
+            {ev.cameraId && can("operator") && (
+              <div className="flex items-center gap-2">
+                <BellOff size={14} className="text-muted" />
+                <select
+                  className="input !py-1.5"
+                  value=""
+                  disabled={busy}
+                  aria-label="Silenciar cámara"
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    if (v === "off") void mute(null);
+                    else if (v) void mute(MUTE_OPTIONS[Number(v)]!);
+                  }}
+                >
+                  <option value="">Silenciar cámara…</option>
+                  {MUTE_OPTIONS.map((o, i) => (
+                    <option key={o.label} value={i}>
+                      {o.label}
+                    </option>
+                  ))}
+                  <option value="off">Reactivar alertas</option>
+                </select>
               </div>
             )}
 

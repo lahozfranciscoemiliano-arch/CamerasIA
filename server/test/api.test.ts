@@ -166,6 +166,63 @@ describe("API: autenticación, 2FA, CSRF, RBAC y bóveda", () => {
     assert.ok(evs.some((e) => e.title === "Persona en perímetro" && e.source.startsWith("ext:")));
   });
 
+  test("ingesta: la misma detección repetida dentro de la ventana se deduplica", async () => {
+    const k = (await req("POST", "/api/ingest/keys", { name: "frigate-dedupe" })).json as { key: string };
+    const post = () =>
+      app.inject({
+        method: "POST",
+        url: "/api/ingest/detections",
+        payload: { title: "Vehículo en playa", type: "vehicle", severity: "medium", camera: "Playa", label: "car" },
+        headers: { authorization: `Bearer ${k.key}` },
+      });
+    const a = (await post()).json() as { id: number; deduped: boolean };
+    const b = (await post()).json() as { id: number; deduped: boolean };
+    assert.equal(a.deduped, false);
+    assert.equal(b.id, a.id);
+    assert.equal(b.deduped, true);
+    const ev = (await req("GET", `/api/events/${a.id}`)).json as { occurrences: number };
+    assert.equal(ev.occurrences, 2);
+  });
+
+  test("acciones masivas, silencio de cámaras y política de alertas: CSRF y RBAC", async () => {
+    // Observador con 2FA simulado (mismo esquema que la prueba de RBAC).
+    assert.equal((await req("POST", "/api/users", { username: "guardia2", role: "viewer", password: "Observador!2026z" })).status, 200);
+    const login = await app.inject({ method: "POST", url: "/api/auth/login", remoteAddress: "10.8.8.8", payload: { username: "guardia2", password: "Observador!2026z" }, headers: { "x-requested-with": "CamerasIA" } });
+    const viewerCookie = String(login.headers["set-cookie"]).split(";")[0]!;
+    assert.equal((await req("POST", "/api/auth/password", { current: "Observador!2026z", next: "Observador!2027w" }, { cookie: viewerCookie })).status, 200);
+    built.ctx.db.run("UPDATE users SET totp_enabled = 1 WHERE username = 'guardia2'");
+
+    const ev = built.ctx.events.create({ type: "person", severity: "high", source: "t", title: "Persona para reconocer" });
+    assert.equal((await req("POST", "/api/events/bulk-status", { status: "ack", ids: [ev.id] }, { cookie: viewerCookie })).status, 403);
+    assert.equal((await req("POST", "/api/events/bulk-status", { status: "ack", ids: [ev.id] }, { csrf: false })).status, 403);
+    assert.equal((await req("POST", "/api/events/bulk-status", { status: "ack" })).status, 400, "ids o filter obligatorio");
+    const dry = await req("POST", "/api/events/bulk-status", { status: "ack", filter: { status: "new", q: "Persona para reconocer" }, dryRun: true });
+    assert.equal(dry.status, 200);
+    assert.equal((dry.json as { count: number }).count, 1);
+    const done = await req("POST", "/api/events/bulk-status", { status: "ack", ids: [ev.id] });
+    assert.equal(done.status, 200);
+    assert.equal((done.json as { count: number }).count, 1);
+    assert.equal(built.ctx.events.get(ev.id)!.status, "ack");
+
+    built.ctx.db.run("INSERT INTO cameras(id, server_id, camera_id, name) VALUES ('x:1', 'x', '1', 'Cámara de prueba')");
+    assert.equal((await req("POST", "/api/cameras/x%3A1/mute", { minutes: 60 }, { cookie: viewerCookie })).status, 403);
+    assert.equal((await req("POST", "/api/cameras/x%3A1/mute", { minutes: 1 })).status, 400);
+    assert.equal((await req("POST", "/api/cameras/x%3A1/mute", { minutes: 60, reason: "obra" })).status, 200);
+    assert.equal(built.ctx.cameras.isMuted("x:1"), true);
+    assert.equal((await req("POST", "/api/cameras/x%3A1/mute", { minutes: null })).status, 200);
+    assert.equal(built.ctx.cameras.isMuted("x:1"), false);
+    const audit = (await req("GET", "/api/audit?action=camera.mute")).json as Array<{ action: string; target: string }>;
+    assert.ok(audit.some((r) => r.action === "camera.mute" && r.target === "x:1"));
+
+    assert.equal((await req("GET", "/api/alerts/settings", undefined, { cookie: viewerCookie })).status, 403);
+    const settings = (await req("GET", "/api/alerts/settings")).json as { vpnDownGraceSec: number };
+    assert.equal(settings.vpnDownGraceSec, 60);
+    assert.equal((await req("PUT", "/api/alerts/settings", { vpnDownGraceSec: 90 }, { cookie: viewerCookie })).status, 403);
+    assert.equal((await req("PUT", "/api/alerts/settings", { vpnDownGraceSec: -5 })).status, 400);
+    assert.equal((await req("PUT", "/api/alerts/settings", { vpnDownGraceSec: 90 })).status, 200);
+    assert.equal(built.ctx.alertSettings.get().vpnDownGraceSec, 90);
+  });
+
   test("la bitácora de auditoría queda íntegra", async () => {
     const v = (await req("GET", "/api/audit/verify")).json as { ok: boolean; checked: number };
     assert.equal(v.ok, true);

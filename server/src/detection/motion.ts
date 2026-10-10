@@ -41,6 +41,8 @@ export interface MotionResult {
   /** Caja aproximada de la zona con cambio (en fracciones 0-1). */
   box: { x: number; y: number; w: number; h: number } | null;
   tamper: boolean;
+  /** El cuadro actual es casi uniforme (para confirmar que el sabotaje persiste). */
+  uniform: boolean;
 }
 
 /**
@@ -81,5 +83,6 @@ export function compareGrids(prev: Float32Array, cur: Float32Array, sensitivity:
     motion: changedFraction >= minFraction && changed >= 3,
     box: maxX >= 0 ? { x: minX / GRID_W, y: minY / GRID_H, w: (maxX - minX + 1) / GRID_W, h: (maxY - minY + 1) / GRID_H } : null,
     tamper,
+    uniform: sCur.std < 4,
   };
 }

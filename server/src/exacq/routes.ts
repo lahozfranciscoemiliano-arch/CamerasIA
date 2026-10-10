@@ -5,7 +5,7 @@ import type { AppCtx } from "../context.js";
 import { HttpError, clientIp } from "../http/guards.js";
 import { ExacqSource, normalizeBaseUrl } from "./client.js";
 import { diagnosticConfig } from "./diagnostics.js";
-import { publicCamera, type ExacqServerRow } from "./service.js";
+import { MUTE_FOREVER, publicCamera, type ExacqServerRow } from "./service.js";
 
 const PatchCamera = z.object({
   name: z.string().min(1).max(80).optional(),
@@ -15,6 +15,12 @@ const PatchCamera = z.object({
   aiVerify: z.boolean().optional(),
   sensitivity: z.number().int().min(1).max(100).optional(),
   sortOrder: z.number().int().min(0).max(9999).optional(),
+});
+
+const MuteBody = z.object({
+  minutes: z.number().int().min(5).max(43_200).nullable(),
+  forever: z.boolean().optional(),
+  reason: z.string().max(200).optional(),
 });
 
 const RangeQuery = z.object({ start: z.coerce.date(), end: z.coerce.date() });
@@ -68,9 +74,30 @@ const publicServer = (s: ExacqServerRow) => ({
 export function registerCameraRoutes(app: FastifyInstance, ctx: AppCtx) {
   const { guard, cameras, audit, db } = ctx;
 
-  app.get("/api/cameras", async (req) => {
+  app.get<{ Querystring: { all?: string } }>("/api/cameras", async (req) => {
     guard(req);
-    return cameras.list();
+    // ?all=1 incluye las deshabilitadas en exacqVision (Administración → Cámaras).
+    return cameras.list({ includeVmsDisabled: req.query.all === "1" || req.query.all === "true" });
+  });
+
+  /** Silencia las alertas de una cámara por un tiempo (o para siempre); minutes = null las reactiva. */
+  app.post<{ Params: { key: string } }>("/api/cameras/:key/mute", async (req) => {
+    const a = guard(req, { role: "operator" });
+    const b = MuteBody.parse(req.body);
+    const row = cameras.row(req.params.key);
+    if (!row) throw new HttpError(404, "Cámara inexistente", "not_found");
+    const until = b.forever ? MUTE_FOREVER : b.minutes === null ? null : Date.now() + b.minutes * 60_000;
+    const updated = cameras.setMute(row.id, until)!;
+    audit.log({
+      userId: a.user.id,
+      username: a.user.username,
+      action: "camera.mute",
+      target: row.id,
+      ip: clientIp(req),
+      details: { until, minutes: b.minutes, forever: Boolean(b.forever), reason: b.reason },
+    });
+    const src = cameras.sources.get(row.server_id);
+    return publicCamera(updated, src?.name, src?.kind);
   });
 
   app.patch<{ Params: { key: string } }>("/api/cameras/:key", async (req) => {

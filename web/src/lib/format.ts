@@ -82,9 +82,15 @@ export const TYPE_LABEL: Record<string, string> = {
   host_up: "Equipo restablecido",
   vpn_up: "VPN conectada",
   vpn_down: "VPN caída",
+  source_down: "Servidor de video sin conexión",
   ai_alert: "Alerta IA",
   external: "Detección externa",
   system: "Sistema",
+};
+
+export const CATEGORY_LABEL: Record<"security" | "infra", string> = {
+  security: "Seguridad",
+  infra: "Infraestructura",
 };
 
 export const ROLE_LABEL = { admin: "Administrador", operator: "Operador", viewer: "Observador", tester: "Tester (ChatGPT)" } as const;
