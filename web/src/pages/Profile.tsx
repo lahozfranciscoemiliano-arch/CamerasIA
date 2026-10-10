@@ -86,7 +86,7 @@ function AlertPrefsPanel() {
             <input className="input" type="number" min={1} max={8} value={prefs.maxToasts} onChange={(e) => setPrefs({ ...prefs, maxToasts: Number(e.target.value) })} />
           </Field>
         </div>
-        <div className="space-y-2">
+        <div className="flex flex-wrap gap-x-6 gap-y-2">
           <Toggle checked={prefs.recoveries} onChange={(v) => setPrefs({ ...prefs, recoveries: v })} label="Avisar recuperaciones (aviso verde, sin sonido)" />
           <Toggle checked={prefs.dndAllowCritical} onChange={(v) => setPrefs({ ...prefs, dndAllowCritical: v })} label='"No molestar" deja pasar las críticas' />
           <Toggle checked={!prefs.muted} onChange={(v) => setPrefs({ ...prefs, muted: !v })} label="Sonidos activados" />

@@ -53,7 +53,7 @@ function AlertBell() {
         {dnd && <span className="hidden md:inline text-[11px] text-info">No molestar · {fmtDuration(dndUntil! - now)}</span>}
       </button>
       {open && (
-        <div role="menu" className="absolute right-0 top-full mt-2 z-50 w-64 panel p-2 space-y-1 shadow-xl">
+        <div role="menu" className="absolute right-0 top-full mt-2 z-50 w-64 rounded-xl border border-line bg-panel p-2 space-y-1 shadow-2xl">
           <button className={item} onClick={() => setPrefs({ ...prefs, muted: !prefs.muted })}>
             {prefs.muted ? "Activar sonidos" : "Silenciar sonidos"}
           </button>
@@ -228,7 +228,7 @@ export default function Layout() {
       </AnimatePresence>
 
       <div className="flex-1 min-w-0 flex flex-col">
-        <header className="h-16 shrink-0 flex items-center gap-3 px-4 border-b border-line-soft bg-bg-2/60 backdrop-blur">
+        <header className="relative z-30 h-16 shrink-0 flex items-center gap-3 px-4 border-b border-line-soft bg-bg-2/60 backdrop-blur">
           <button className="lg:hidden btn btn-ghost btn-sm" onClick={() => setMobileOpen(true)} aria-label="Menú">
             <Menu size={18} />
           </button>
