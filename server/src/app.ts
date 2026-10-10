@@ -19,6 +19,9 @@ import { AuthError, AuthService } from "./auth/service.js";
 import { HttpError, makeGuard } from "./http/guards.js";
 import { CameraService } from "./exacq/service.js";
 import { EventService } from "./events/service.js";
+import { AlertSettingsStore } from "./events/settings.js";
+import { IncidentManager } from "./events/incidents.js";
+import { NotificationHub } from "./events/notify.js";
 import { VpnManager } from "./vpn/manager.js";
 import { HealthService } from "./health/service.js";
 import { AiService } from "./ai/service.js";
@@ -67,9 +70,10 @@ export async function buildApp(cfg: AppConfig, opts: { logger?: boolean } = {}):
   const ai = new AiService(db, vault, cfg);
 
   // Los servicios se referencian entre sí mediante callbacks para evitar dependencias circulares.
-  let events!: EventService;
-  let cameras!: CameraService;
-  cameras = new CameraService(db, vault, bus, {
+  // Toda la política de alertas de infraestructura vive en IncidentManager; los servicios sólo informan estado.
+  const alertSettings = new AlertSettingsStore(db);
+  let incidents!: IncidentManager;
+  const cameras: CameraService = new CameraService(db, vault, bus, {
     demo: cfg.DEMO_MODE,
     exportsDir: cfg.paths.exports,
     log,
@@ -77,51 +81,72 @@ export async function buildApp(cfg: AppConfig, opts: { logger?: boolean } = {}):
       // "detect" ya lo audita la ruta con el usuario que lo pidió.
       if (reason === "auto") audit.log({ username: "sistema", action: "exacq.template_auto", target: server.name, details: t });
     },
-    onCameraStatusChange: (cam, online) => {
-      if (online) {
-        events.autoResolve("camera_offline", cam.id);
-        events.create({ type: "camera_online", severity: "info", source: "sistema", cameraId: cam.id, title: `Cámara ${cam.name} recuperó señal` });
-      } else {
-        events.create({ type: "camera_offline", severity: "high", source: "sistema", cameraId: cam.id, title: `Cámara ${cam.name} sin señal`, description: "La cámara dejó de responder en el servidor de video." });
-      }
+    onCamerasOffline: (src, cams) => incidents.onCamerasOffline(src, cams),
+    onCamerasOnline: (cams) => incidents.onCamerasOnline(cams),
+    onSourceDown: (src, affected, err, since) => incidents.onSourceDown(src, affected, err, since),
+    onSourceUp: (src, still, downMs) => incidents.onSourceUp(src, still, downMs),
+    onVmsDisabled: (cams) => incidents.onVmsDisabled(cams),
+    availability: () => {
+      const s = alertSettings.get();
+      return {
+        cameraMinSyncs: s.cameraOfflineMinSyncs,
+        cameraAfterMs: s.cameraOfflineAfterSec * 1000,
+        sourceMinSyncs: s.sourceDownMinSyncs,
+        sourceAfterMs: s.sourceDownAfterSec * 1000,
+      };
     },
   });
-  events = new EventService(db, bus, cfg.paths.snapshots, (id) => cameras.row(id)?.name);
+  const events = new EventService(db, bus, cfg.paths.snapshots, (id) => cameras.row(id)?.name, {
+    cameraMuted: (id) => cameras.isMuted(id),
+    flapThreshold: () => alertSettings.get().flapThreshold,
+  });
+  const notifier = new NotificationHub(bus, events, () => {
+    const s = alertSettings.get();
+    return { coalesceMs: s.notifyCoalesceMs, maxPerMinute: s.maxNotificationsPerMin, minSeverity: s.notifyMinSeverity };
+  });
+  events.setNotifier(notifier);
 
   const vpn = new VpnManager(db, vault, bus, cfg, {
     log,
-    onUp: (s) => {
-      events.autoResolve("vpn_down", null);
-      events.create({ type: "vpn_up", severity: "info", source: "vpn", title: `Túnel FortiVPN activo (${s.profileName})`, description: `IP asignada ${s.assignedIp ?? "-"} vía ${s.gateway}` });
+    onUp: () => {
+      incidents.onVpnUp();
       setTimeout(() => void cameras.sync().catch(() => undefined), 3000);
     },
-    onDown: (s, unexpected) =>
-      events.create({
-        type: "vpn_down",
-        severity: unexpected ? "high" : "info",
-        source: "vpn",
-        title: unexpected ? `Se cayó el túnel FortiVPN (${s.profileName})` : `Túnel FortiVPN cerrado (${s.profileName})`,
-        description: s.error ?? undefined,
-      }),
+    onDown: (s, unexpected) => incidents.onVpnDown(s, unexpected),
   });
 
   const health = new HealthService(db, bus, {
     demo: cfg.DEMO_MODE,
     dataDir: cfg.paths.data,
-    onHostChange: (h, up) => {
-      if (up) {
-        events.autoResolve("host_down", null, h.id);
-        events.create({ type: "host_up", severity: "info", source: "noc", title: `${h.name} volvió a responder`, meta: { hostId: h.id } });
-      } else {
-        events.create({ type: "host_down", severity: h.kind === "camera" ? "medium" : "high", source: "noc", title: `${h.name} no responde (${h.host.replace(/^demo:/, "")}:${h.port})`, meta: { hostId: h.id } });
+    onHostChange: (h, up) => incidents.onHostChange(h, up),
+    onRound: (hosts) => incidents.reconcileHosts(hosts),
+    rules: () => alertSettings.get(),
+  });
+
+  incidents = new IncidentManager({
+    db,
+    events,
+    settings: () => alertSettings.get(),
+    vpnStatus: () => vpn.status(),
+    sourceHost: (id) => {
+      const srv = cameras.servers().find((s) => s.id === id);
+      try {
+        return srv ? new URL(srv.base_url).hostname : undefined;
+      } catch {
+        return undefined;
       }
     },
   });
 
-  const detection = new DetectionEngine(db, cameras, events, ai, { intervalMs: 2000, cooldownMs: cfg.DEMO_MODE ? 120_000 : 60_000, log });
+  const detection = new DetectionEngine(db, cameras, events, ai, {
+    intervalMs: 2000,
+    cooldownMs: cfg.DEMO_MODE ? 120_000 : 60_000,
+    log,
+    rules: () => alertSettings.get(),
+  });
   const demoSim = cfg.DEMO_MODE ? new DemoSimulator(db, cameras, events) : null;
 
-  const ctx: AppCtx = { cfg, db, bus, audit, vault, auth, guard, cameras, events, vpn, health, ai, detection, log };
+  const ctx: AppCtx = { cfg, db, bus, audit, vault, auth, guard, cameras, events, vpn, health, ai, detection, alertSettings, incidents, notifier, log };
 
   // ───────── Plugins de seguridad ─────────
   await app.register(cookie);
@@ -223,11 +248,14 @@ export async function buildApp(cfg: AppConfig, opts: { logger?: boolean } = {}):
     demoSim?.start();
     health.start();
     detection.start();
+    incidents.start();
+    notifier.resumePending(db);
     await vpn.autoConnect();
   };
 
   const shutdown = async () => {
     detection.stop();
+    incidents.stop();
     demoSim?.stop();
     health.stop();
     vpn.stop();

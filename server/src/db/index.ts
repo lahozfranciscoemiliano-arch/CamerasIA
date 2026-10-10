@@ -256,7 +256,56 @@ const MIGRATIONS: Migration[] = [
   DROP TABLE users;
   ALTER TABLE users_new RENAME TO users;
   ` },
+  // 3 — alertas: deduplicación, notificación, silencio por cámara y estado en el VMS.
+  { sql: `
+  ALTER TABLE events ADD COLUMN dedupe_key TEXT;
+  ALTER TABLE events ADD COLUMN occurrences INTEGER NOT NULL DEFAULT 1;
+  ALTER TABLE events ADD COLUMN last_ts INTEGER;
+  ALTER TABLE events ADD COLUMN notified_at INTEGER;
+  ALTER TABLE events ADD COLUMN silent INTEGER NOT NULL DEFAULT 0;
+  -- Lo histórico no se vuelve a notificar.
+  UPDATE events SET last_ts = ts, notified_at = ts;
+  UPDATE events SET dedupe_key = 'camera_offline:' || camera_id
+    WHERE type = 'camera_offline' AND camera_id IS NOT NULL AND status IN ('new','ack','investigating');
+  UPDATE events SET dedupe_key = 'host_down:' || json_extract(meta, '$.hostId')
+    WHERE type = 'host_down' AND status IN ('new','ack','investigating')
+      AND CASE WHEN json_valid(meta) THEN json_extract(meta, '$.hostId') IS NOT NULL ELSE 0 END;
+  UPDATE events SET dedupe_key = 'vpn_down' WHERE type = 'vpn_down' AND severity != 'info' AND status IN ('new','ack','investigating');
+  CREATE INDEX events_dedupe_open ON events(dedupe_key)
+    WHERE dedupe_key IS NOT NULL AND status IN ('new','ack','investigating');
+
+  ALTER TABLE cameras ADD COLUMN vms_disabled INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE cameras ADD COLUMN alerts_muted_until INTEGER;
+  ALTER TABLE cameras ADD COLUMN offline_since INTEGER;
+  ALTER TABLE cameras ADD COLUMN offline_event_id INTEGER;
+  -- raw se guarda truncado a 20 000 caracteres: json_valid evita que json_extract aborte la migración.
+  UPDATE cameras SET vms_disabled = 1
+    WHERE CASE WHEN json_valid(raw)
+               THEN (json_extract(raw, '$.disabled') IN (1, '1', 'true') OR json_extract(raw, '$.enabled') = 0)
+               ELSE 0 END;
+  UPDATE cameras SET offline_event_id = (
+      SELECT MAX(e.id) FROM events e
+      WHERE e.dedupe_key = 'camera_offline:' || cameras.id AND e.status IN ('new','ack','investigating'))
+    WHERE online = 0 AND vms_disabled = 0;
+  -- Las deshabilitadas en exacqVision nunca debieron alertar (sin tocar ack_* para no falsear el MTTA).
+  UPDATE events SET status = 'resolved', resolved_by = 'sistema',
+         resolved_at = CAST(strftime('%s','now') AS INTEGER) * 1000
+    WHERE type = 'camera_offline' AND status IN ('new','ack','investigating')
+      AND camera_id IN (SELECT id FROM cameras WHERE vms_disabled = 1);
+  UPDATE cameras SET online = 0, offline_event_id = NULL WHERE vms_disabled = 1;
+  -- Caídas de cámaras que ya están en línea quedaron abiertas: se cierran.
+  UPDATE events SET status = 'resolved', resolved_by = 'sistema',
+         resolved_at = CAST(strftime('%s','now') AS INTEGER) * 1000
+    WHERE type = 'camera_offline' AND status IN ('new','ack','investigating')
+      AND camera_id IN (SELECT id FROM cameras WHERE online = 1);
+  -- Las recuperaciones informativas (y los cierres manuales de la VPN) ya no quedan abiertas: inflaban el contador.
+  UPDATE events SET status = 'resolved', resolved_by = 'sistema', resolved_at = ts, silent = 1
+    WHERE (type IN ('camera_online','host_up','vpn_up') OR (type = 'vpn_down' AND severity = 'info')) AND status = 'new';
+  ` },
 ];
+
+/** Versión de esquema que deja aplicada la última migración. */
+export const SCHEMA_VERSION = MIGRATIONS.length;
 
 function clean(params?: Params): Record<string, SQLInputValue> | undefined {
   if (!params) return undefined;

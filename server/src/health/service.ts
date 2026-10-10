@@ -16,7 +16,19 @@ export interface HostRow {
   last_latency_ms: number | null;
   last_checked_at: number | null;
   last_change_at: number | null;
+  /** Último sondeo crudo (en memoria; el estado confirmado es last_status). */
+  probe_ok?: boolean | null;
+  /** Fallos seguidos todavía sin confirmar la caída. */
+  fails?: number;
 }
+
+export interface HealthRules {
+  hostDownAfterChecks: number;
+  hostUpAfterChecks: number;
+  hostProbeRetryMs: number;
+}
+
+type Probe = (host: string, port: number) => Promise<{ ok: boolean; latencyMs: number | null; error?: string }>;
 
 export function tcpProbe(host: string, port: number, timeoutMs = 2500): Promise<{ ok: boolean; latencyMs: number | null; error?: string }> {
   return new Promise((resolve) => {
@@ -39,11 +51,23 @@ export function tcpProbe(host: string, port: number, timeoutMs = 2500): Promise<
 export class HealthService {
   private timer?: NodeJS.Timeout;
   private cpuPrev = os.cpus().map((c) => c.times);
+  // Histéresis por equipo: sondeos seguidos en contra del estado confirmado.
+  private fails = new Map<string, number>();
+  private oks = new Map<string, number>();
+  private probeOk = new Map<string, boolean>();
 
   constructor(
     private db: Db,
     private bus: Bus,
-    private opts: { demo: boolean; dataDir: string; onHostChange?: (h: HostRow, up: boolean) => void },
+    private opts: {
+      demo: boolean;
+      dataDir: string;
+      onHostChange?: (h: HostRow, up: boolean) => void;
+      /** Al terminar cada ronda de chequeos (reconciliación de alertas suprimidas). */
+      onRound?: (hosts: HostRow[]) => void;
+      rules?: () => HealthRules;
+      probe?: Probe;
+    },
   ) {}
 
   start() {
@@ -57,7 +81,9 @@ export class HealthService {
   }
 
   list() {
-    return this.db.all<HostRow>("SELECT * FROM monitored_hosts ORDER BY kind, name");
+    return this.db
+      .all<HostRow>("SELECT * FROM monitored_hosts ORDER BY kind, name")
+      .map((h) => ({ ...h, probe_ok: this.probeOk.get(h.id) ?? null, fails: this.fails.get(h.id) ?? 0 }));
   }
 
   add(input: { name: string; host: string; port: number; kind: string }) {
@@ -86,24 +112,53 @@ export class HealthService {
     return { ok: !down, latencyMs: down ? null : Math.round(2 + Math.random() * (h.kind === "fortigate" ? 25 : 8)) };
   }
 
+  private async probeOnce(h: HostRow) {
+    if (this.opts.demo && h.host.startsWith("demo:")) return this.simulated(h);
+    return (this.opts.probe ?? tcpProbe)(h.host, h.port);
+  }
+
+  /**
+   * Chequea todos los equipos. Un sondeo fallido se reintenta una vez; la caída se confirma tras
+   * `hostDownAfterChecks` chequeos fallidos seguidos y la recuperación tras `hostUpAfterChecks` correctos.
+   * host_checks guarda siempre el resultado crudo (para los gráficos).
+   */
   async checkAll() {
+    const rules = this.opts.rules?.() ?? { hostDownAfterChecks: 3, hostUpAfterChecks: 2, hostProbeRetryMs: 500 };
     const hosts = this.list().filter((h) => h.enabled);
     const now = Date.now();
     await Promise.all(
       hosts.map(async (h) => {
-        const r = this.opts.demo && h.host.startsWith("demo:") ? this.simulated(h) : await tcpProbe(h.host, h.port);
-        const status = r.ok ? "up" : "down";
+        let r = await this.probeOnce(h);
+        if (!r.ok) {
+          if (rules.hostProbeRetryMs > 0) await new Promise((res) => setTimeout(res, rules.hostProbeRetryMs));
+          r = await this.probeOnce(h);
+        }
+        this.probeOk.set(h.id, r.ok);
+        const raw = r.ok ? "up" : "down";
+        let status = h.last_status ?? raw;
+        if (h.last_status !== null && raw !== h.last_status) {
+          const counter = r.ok ? this.oks : this.fails;
+          const n = (counter.get(h.id) ?? 0) + 1;
+          counter.set(h.id, n);
+          if (n >= (r.ok ? rules.hostUpAfterChecks : rules.hostDownAfterChecks)) status = raw;
+        }
+        if (raw === status) {
+          this.fails.delete(h.id);
+          this.oks.delete(h.id);
+        } else (r.ok ? this.fails : this.oks).delete(h.id);
         const changed = h.last_status !== null && h.last_status !== status;
         this.db.run(
           "UPDATE monitored_hosts SET last_status = $s, last_latency_ms = $l, last_checked_at = $now, last_change_at = CASE WHEN $changed THEN $now ELSE COALESCE(last_change_at, $now) END WHERE id = $id",
           { s: status, l: r.latencyMs, now, changed, id: h.id },
         );
         this.db.run("INSERT INTO host_checks(host_id, ts, ok, latency_ms) VALUES($id, $now, $ok, $l)", { id: h.id, now, ok: r.ok, l: r.latencyMs });
-        if (changed) this.opts.onHostChange?.({ ...h, last_status: status }, r.ok);
+        if (changed) this.opts.onHostChange?.({ ...h, last_status: status }, status === "up");
       }),
     );
     this.db.run("DELETE FROM host_checks WHERE ts < $cutoff", { cutoff: now - 24 * 3600_000 });
-    this.bus.publish("health.update", { hosts: this.list().map(publicHost), system: this.system() });
+    const all = this.list();
+    this.opts.onRound?.(all);
+    this.bus.publish("health.update", { hosts: all.map(publicHost), system: this.system() });
   }
 
   seedDemo() {
@@ -167,4 +222,6 @@ export const publicHost = (h: HostRow) => ({
   checkedAt: h.last_checked_at,
   changedAt: h.last_change_at,
   simulated: h.host.startsWith("demo:"),
+  probeOk: h.probe_ok ?? null,
+  unstable: Boolean(h.fails) && h.last_status === "up",
 });

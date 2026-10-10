@@ -11,6 +11,9 @@ import type { VpnManager } from "./vpn/manager.js";
 import type { HealthService } from "./health/service.js";
 import type { AiService } from "./ai/service.js";
 import type { DetectionEngine } from "./detection/engine.js";
+import type { AlertSettingsStore } from "./events/settings.js";
+import type { IncidentManager } from "./events/incidents.js";
+import type { NotificationHub } from "./events/notify.js";
 
 export interface AppCtx {
   cfg: AppConfig;
@@ -26,5 +29,8 @@ export interface AppCtx {
   health: HealthService;
   ai: AiService;
   detection: DetectionEngine;
+  alertSettings: AlertSettingsStore;
+  incidents: IncidentManager;
+  notifier: NotificationHub;
   log: (msg: string) => void;
 }

@@ -1,14 +1,25 @@
-import { Cctv, CheckCircle2, Copy, Edit3, FileClock, KeyRound, Link2, Plug, Plus, RefreshCw, ScanSearch, Server, ShieldCheck, Sparkles, Trash2, Unlock, UserPlus, Users, Webhook, XCircle } from "lucide-react";
+import { BellRing, Cctv, CheckCircle2, Copy, Edit3, FileClock, KeyRound, Link2, Plug, Plus, RefreshCw, ScanSearch, Server, ShieldCheck, Sparkles, Trash2, Unlock, UserPlus, Users, Webhook, XCircle } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useToast } from "../components/toasts";
 import { Dot, Empty, ErrorNote, Field, Modal, OkNote, PageHeader, Panel, Spinner, Tabs, Toggle } from "../components/ui";
 import { api, ApiError } from "../lib/api";
 import { useAuth } from "../lib/auth";
-import { fmtAgo, fmtDateTime, ROLE_LABEL } from "../lib/format";
+import { fmtAgo, fmtDateTime, fmtHM, ROLE_LABEL, SEVERITY_LABEL } from "../lib/format";
 import { useApi } from "../lib/hooks";
-import type { AuditRow, Camera, ExacqServer, Role, User, VaultEntry, VpnProfile } from "../lib/types";
+import type { AlertSettings, AuditRow, Camera, ExacqServer, Role, Severity, User, VaultEntry, VpnProfile } from "../lib/types";
 
-type Tab = "users" | "servers" | "cameras" | "ai" | "integrations" | "audit";
+type Tab = "users" | "servers" | "cameras" | "alerts" | "ai" | "integrations" | "audit";
+
+const MUTE_CHOICES: Array<{ value: string; label: string; minutes?: number; forever?: boolean }> = [
+  { value: "", label: "Activas" },
+  { value: "60", label: "Silenciar 1 h", minutes: 60 },
+  { value: "480", label: "Silenciar 8 h", minutes: 480 },
+  { value: "1440", label: "Silenciar 24 h", minutes: 1440 },
+  { value: "10080", label: "Silenciar 7 d", minutes: 10_080 },
+  { value: "forever", label: "Silenciar siempre", forever: true },
+];
+// "Para siempre" se guarda como 9999-12-31.
+const FOREVER_FROM = Date.UTC(9000, 0, 1);
 
 // ───────────────────────── Usuarios ─────────────────────────
 function UsersTab() {
@@ -466,7 +477,19 @@ function CamerasTab() {
   const { can } = useAuth();
   const canAdmin = can("admin");
   const toast = useToast();
-  const { data: cams, setData } = useApi<Camera[]>("/api/cameras");
+  const canMute = can("operator");
+  // Incluye las deshabilitadas en exacqVision (se muestran atenuadas).
+  const { data: cams, setData } = useApi<Camera[]>("/api/cameras?all=1");
+  const mute = async (c: Camera, value: string) => {
+    const choice = MUTE_CHOICES.find((m) => m.value === value);
+    try {
+      const u = await api.post<Camera>(`/api/cameras/${encodeURIComponent(c.id)}/mute`, choice?.forever ? { minutes: null, forever: true } : { minutes: choice?.minutes ?? null });
+      setData((all) => all?.map((x) => (x.id === c.id ? u : x)) ?? all);
+      toast({ tone: "ok", title: choice?.minutes || choice?.forever ? `Alertas de ${c.name} silenciadas` : `Alertas de ${c.name} activas` });
+    } catch (e) {
+      toast({ tone: "error", title: (e as ApiError).message });
+    }
+  };
   const patch = async (c: Camera, body: Record<string, unknown>) => {
     try {
       const u = await api.patch<Camera>(`/api/cameras/${encodeURIComponent(c.id)}`, body);
@@ -491,21 +514,25 @@ function CamerasTab() {
               <th className="pr-3">Detección</th>
               <th className="pr-3">Verificación IA</th>
               <th className="pr-3">Sensibilidad</th>
+              <th className="pr-3">Alertas</th>
             </tr>
           </thead>
           <tbody>
             {cams?.map((c) => (
-              <tr key={c.id} className="border-t border-line-soft">
+              <tr key={c.id} className={`border-t border-line-soft ${c.vmsDisabled ? "opacity-50" : ""}`}>
                 <td className="py-2 pr-3">
                   <span className="flex items-center gap-2">
-                    <Dot tone={c.online ? "ok" : "crit"} />
+                    <Dot tone={c.vmsDisabled ? "muted" : c.online ? "ok" : "crit"} />
                     <input className="input !py-1 !w-48" readOnly={!canAdmin} defaultValue={c.name} onBlur={(e) => canAdmin && e.target.value !== c.name && void patch(c, { name: e.target.value })} />
                   </span>
                 </td>
                 <td className="pr-3">
                   <input className="input !py-1 !w-36" readOnly={!canAdmin} defaultValue={c.zone ?? ""} placeholder="Perímetro, Depósito…" onBlur={(e) => canAdmin && e.target.value !== (c.zone ?? "") && void patch(c, { zone: e.target.value || null })} />
                 </td>
-                <td className="pr-3 text-xs text-ink-2">{c.serverName}</td>
+                <td className="pr-3 text-xs text-ink-2">
+                  {c.serverName}
+                  {c.vmsDisabled && <div className="text-[10px] text-muted whitespace-nowrap">Deshabilitada en exacqVision</div>}
+                </td>
                 <td className="pr-3">
                   <Toggle checked={c.enabled} onChange={(v) => void patch(c, { enabled: v })} disabled={!canAdmin} />
                 </td>
@@ -519,11 +546,133 @@ function CamerasTab() {
                   <input type="range" min={1} max={100} defaultValue={c.sensitivity} disabled={!canAdmin} className="accent-[#22d3ee] w-28" onMouseUp={(e) => canAdmin && void patch(c, { sensitivity: Number((e.target as HTMLInputElement).value) })} onKeyUp={(e) => canAdmin && void patch(c, { sensitivity: Number((e.target as HTMLInputElement).value) })} />
                   <span className="text-xs font-mono ml-1">{c.sensitivity}</span>
                 </td>
+                <td className="pr-3">
+                  <select className="input !py-1 !w-40" value="" disabled={!canMute || c.vmsDisabled} onChange={(e) => void mute(c, e.target.value)} aria-label={`Alertas de ${c.name}`}>
+                    <option value="" disabled>
+                      {c.alertsMutedUntil ? (c.alertsMutedUntil >= FOREVER_FROM ? "Silenciada siempre" : `Silenciada hasta ${fmtHM(c.alertsMutedUntil)}`) : "Activas"}
+                    </option>
+                    {MUTE_CHOICES.filter((m) => m.value || c.alertsMutedUntil).map((m) => (
+                      <option key={m.value || "on"} value={m.value || "on"}>
+                        {m.value ? m.label : "Reactivar"}
+                      </option>
+                    ))}
+                  </select>
+                </td>
               </tr>
             ))}
           </tbody>
         </table>
       </div>
+    </Panel>
+  );
+}
+
+// ───────────────────────── Alertas (política del servidor) ─────────────────────────
+const ALERT_FIELDS: Array<{ group: string; fields: Array<{ key: keyof AlertSettings; label: string; unit?: string }> }> = [
+  {
+    group: "Cámaras y servidores de video",
+    fields: [
+      { key: "cameraOfflineAfterSec", label: "Cámara sin señal: avisar tras", unit: "s" },
+      { key: "cameraOfflineMinSyncs", label: "…y al menos estas sincronizaciones seguidas" },
+      { key: "groupMinCameras", label: "Agrupar desde (cámaras a la vez)" },
+      { key: "sourceDownAfterSec", label: "Servidor caído: avisar tras", unit: "s" },
+      { key: "sourceDownMinSyncs", label: "…y al menos estas sincronizaciones seguidas" },
+      { key: "sourceCriticalAfterMin", label: "Servidor caído: crítica tras", unit: "min" },
+    ],
+  },
+  {
+    group: "VPN y equipos",
+    fields: [
+      { key: "vpnDownGraceSec", label: "VPN caída: período de gracia (microcortes)", unit: "s" },
+      { key: "vpnCriticalAfterMin", label: "VPN caída: crítica tras", unit: "min" },
+      { key: "hostDownAfterChecks", label: "Equipo caído tras chequeos fallidos" },
+      { key: "hostUpAfterChecks", label: "Equipo recuperado tras chequeos correctos" },
+      { key: "hostProbeRetryMs", label: "Reintento de sondeo", unit: "ms" },
+    ],
+  },
+  {
+    group: "Repeticiones y detección",
+    fields: [
+      { key: "reopenWindowMin", label: "Reabrir el mismo evento si vuelve a caer dentro de", unit: "min" },
+      { key: "motionDedupeMin", label: "Movimiento: agrupar repeticiones durante", unit: "min" },
+      { key: "aiReverifyMin", label: "Re-verificar con IA cada", unit: "min" },
+      { key: "tamperConfirmFrames", label: "Sabotaje: cuadros seguidos para confirmar" },
+      { key: "tamperGlobalCameras", label: "Sabotaje simultáneo = cambio global desde (cámaras)" },
+      { key: "tamperGlobalWindowSec", label: "Ventana de sabotaje simultáneo", unit: "s" },
+      { key: "tamperDedupeMin", label: "Sabotaje: agrupar repeticiones durante", unit: "min" },
+      { key: "ingestDedupeSec", label: "Detecciones externas: agrupar repeticiones durante", unit: "s" },
+    ],
+  },
+  {
+    group: "Notificaciones",
+    fields: [
+      { key: "notifyCoalesceMs", label: "Agrupar avisos que llegan dentro de", unit: "ms" },
+      { key: "maxNotificationsPerMin", label: "Máximo de avisos por minuto (las críticas no esperan)" },
+    ],
+  },
+];
+
+function AlertsTab() {
+  const { can } = useAuth();
+  const canAdmin = can("admin");
+  const toast = useToast();
+  const { data } = useApi<AlertSettings>("/api/alerts/settings");
+  const [form, setForm] = useState<AlertSettings | null>(null);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    if (data) setForm(data);
+  }, [data]);
+  if (!form) return <Spinner />;
+  return (
+    <Panel title="Política de alertas del servidor" icon={<BellRing size={16} />} bodyClass="p-4 space-y-5 max-w-4xl">
+      <p className="text-sm text-ink-2">
+        Regla general: <b>se avisa si algo sigue caído más de 1 minuto</b>. Los microcortes se registran sin avisar, las caídas simultáneas se agrupan y lo
+        repetido suma ocurrencias en el mismo evento. Cada consola elige además qué ve y oye en <i>Mi perfil → Alertas en esta consola</i>.
+      </p>
+      {ALERT_FIELDS.map((g) => (
+        <div key={g.group}>
+          <div className="label mb-2">{g.group}</div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            {g.fields.map((f) => (
+              <Field key={f.key} label={`${f.label}${f.unit ? ` (${f.unit})` : ""}`}>
+                <input
+                  className="input"
+                  type="number"
+                  readOnly={!canAdmin}
+                  value={form[f.key] as number}
+                  onChange={(e) => setForm({ ...form, [f.key]: Number(e.target.value) })}
+                />
+              </Field>
+            ))}
+          </div>
+        </div>
+      ))}
+      <Field label="Severidad mínima para notificar">
+        <select className="input !w-48" disabled={!canAdmin} value={form.notifyMinSeverity} onChange={(e) => setForm({ ...form, notifyMinSeverity: e.target.value as Severity })}>
+          {(["info", "low", "medium", "high", "critical"] as Severity[]).map((s) => (
+            <option key={s} value={s}>
+              {SEVERITY_LABEL[s]}
+            </option>
+          ))}
+        </select>
+      </Field>
+      <ErrorNote>{error}</ErrorNote>
+      {canAdmin && (
+        <button
+          className="btn btn-primary"
+          onClick={async () => {
+            setError("");
+            try {
+              setForm(await api.put<AlertSettings>("/api/alerts/settings", form));
+              toast({ tone: "ok", title: "Política de alertas guardada" });
+            } catch (e) {
+              setError((e as ApiError).message);
+            }
+          }}
+        >
+          Guardar
+        </button>
+      )}
     </Panel>
   );
 }
@@ -648,7 +797,7 @@ function AuditTab() {
         <>
           <select className="input !py-1 !w-44" value={action} onChange={(e) => setAction(e.target.value)}>
             <option value="">Todas las acciones</option>
-            {["auth", "vault", "vpn", "user", "exacq", "camera", "event", "recording", "ai", "ingest"].map((a) => (
+            {["auth", "vault", "vpn", "user", "exacq", "camera", "event", "alerts", "recording", "ai", "ingest"].map((a) => (
               <option key={a} value={a}>
                 {a}.*
               </option>
@@ -709,7 +858,7 @@ export default function Admin() {
   const [tab, setTab] = useState<Tab>("servers");
   return (
     <div className="space-y-4">
-      <PageHeader title="Administración" subtitle="Usuarios, servidores de video, cámaras, IA, integraciones y auditoría" icon={<ShieldCheck size={20} />} />
+      <PageHeader title="Administración" subtitle="Usuarios, servidores de video, cámaras, alertas, IA, integraciones y auditoría" icon={<ShieldCheck size={20} />} />
       {!can("admin") && <div className="text-xs text-ink-2 rounded-lg border border-line bg-panel px-3 py-2">Acceso Tester: consulta de configuración y diagnósticos de exacqVision. Los cambios requieren un administrador.</div>}
       <Tabs
         value={tab}
@@ -717,6 +866,7 @@ export default function Admin() {
         tabs={[
           { id: "servers", label: "Servidores exacqVision", icon: <Server size={15} /> },
           { id: "cameras", label: "Cámaras", icon: <Cctv size={15} /> },
+          { id: "alerts", label: "Alertas", icon: <BellRing size={15} /> },
           { id: "users", label: "Usuarios", icon: <Users size={15} /> },
           { id: "ai", label: "IA", icon: <Sparkles size={15} /> },
           { id: "integrations", label: "Integraciones", icon: <Webhook size={15} /> },
@@ -726,6 +876,7 @@ export default function Admin() {
       {tab === "users" && <UsersTab />}
       {tab === "servers" && <ServersTab />}
       {tab === "cameras" && <CamerasTab />}
+      {tab === "alerts" && <AlertsTab />}
       {tab === "ai" && <AiTab />}
       {tab === "integrations" && <IntegrationsTab />}
       {tab === "audit" && <AuditTab />}

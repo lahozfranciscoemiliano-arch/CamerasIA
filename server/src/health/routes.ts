@@ -47,7 +47,9 @@ export function registerHealthRoutes(app: FastifyInstance, ctx: AppCtx) {
   /** Resumen único para el tablero NOC/SOC. */
   app.get("/api/dashboard", async (req) => {
     guard(req);
-    const cams = cameras.list();
+    // Las deshabilitadas en exacqVision (y las ocultas por el usuario) no cuentan como "sin señal".
+    const cams = cameras.list().filter((c) => c.enabled);
+    const vmsDisabled = cameras.list({ includeVmsDisabled: true }).filter((c) => c.vmsDisabled).length;
     return {
       now: Date.now(),
       demo: ctx.cfg.DEMO_MODE,
@@ -59,13 +61,14 @@ export function registerHealthRoutes(app: FastifyInstance, ctx: AppCtx) {
         offline: cams.filter((c) => !c.online).map((c) => ({ id: c.id, name: c.name })),
         detection: cams.filter((c) => c.motionEnabled).length,
         aiVerify: cams.filter((c) => c.aiVerify).length,
+        vmsDisabled,
       },
       sources: cameras.sourceStatuses(),
       vpn: vpn.status(),
       hosts: health.list().map(publicHost),
       system: health.system(),
       ai: { available: ai.available(), model: ai.model, budget: ai.budget(), engine: ctx.detection.stats },
-      recent: events.list({ limit: 12 }),
+      recent: events.list({ limit: 12, silent: false }),
     };
   });
 }

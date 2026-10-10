@@ -29,11 +29,17 @@ export default function Dashboard() {
   const events = recent ?? data?.recent ?? [];
 
   useTopic<SecEvent>("event.new", (ev) => {
-    setRecent([ev, ...(recent ?? data?.recent ?? [])].slice(0, 14));
+    // Actualización funcional: en una ráfaga no se pierde ningún evento. Los silenciados no van al feed.
+    if (!ev.silent) setRecent((cur) => [ev, ...(cur ?? data?.recent ?? [])].slice(0, 14));
     scheduleReload();
   });
   useTopic<SecEvent>("event.update", (ev) => {
     setRecent((cur) => (cur ?? data?.recent ?? []).map((e) => (e.id === ev.id ? ev : e)));
+    scheduleReload();
+  });
+  useTopic<{ ids: number[]; status: SecEvent["status"] }>("event.bulk", (b) => {
+    const ids = new Set(b.ids);
+    setRecent((cur) => (cur ?? data?.recent ?? []).map((e) => (ids.has(e.id) ? { ...e, status: b.status } : e)));
     scheduleReload();
   });
   useTopic<VpnStatus>("vpn.status", (vpn) => setData((d) => (d ? { ...d, vpn } : d)));
@@ -68,8 +74,25 @@ export default function Dashboard() {
       )}
 
       <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3">
-        <StatTile label="Cámaras en línea" value={data.cameras.online} suffix={`/ ${data.cameras.total}`} icon={<Cctv size={18} />} tone={data.cameras.offline.length ? "warn" : "ok"} hint={data.cameras.offline.length ? `${data.cameras.offline.length} sin señal` : "Todas operativas"} />
-        <StatTile label="Eventos abiertos" value={s.open} icon={<Siren size={18} />} tone={s.openCritical ? "crit" : s.open ? "warn" : "ok"} hint={`${s.openCritical} de severidad alta/crítica`} />
+        <StatTile
+          label="Cámaras en línea"
+          value={data.cameras.online}
+          suffix={`/ ${data.cameras.total}`}
+          icon={<Cctv size={18} />}
+          tone={data.cameras.offline.length ? "warn" : "ok"}
+          hint={
+            [data.cameras.offline.length ? `${data.cameras.offline.length} sin señal` : "Todas operativas", data.cameras.vmsDisabled ? `${data.cameras.vmsDisabled} deshabilitadas en exacq` : ""]
+              .filter(Boolean)
+              .join(" · ")
+          }
+        />
+        <StatTile
+          label="Eventos abiertos"
+          value={s.openAlerting ?? s.open}
+          icon={<Siren size={18} />}
+          tone={s.openCritical ? "crit" : (s.openAlerting ?? s.open) ? "warn" : "ok"}
+          hint={`${s.openCritical} de severidad alta/crítica`}
+        />
         <StatTile label="Eventos 24 h" value={s.total} icon={<Activity size={18} />} tone="info" hint={`${s.bySeverity.critical ?? 0} críticos · ${s.bySeverity.high ?? 0} altos`} />
         <StatTile label="Verificados por IA" value={s.aiVerified} icon={<BrainCircuit size={18} />} tone="ai" hint={`${data.ai.engine.aiDismissed} falsas alarmas descartadas`} />
         <StatTile label="Tiempo de reconocimiento" value={(s.mttaMs ?? 0) / 60000} format={(n) => n.toFixed(1)} suffix="min" icon={<Clock size={18} />} tone="accent" hint="Promedio (MTTA) 24 h" />

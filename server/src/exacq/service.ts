@@ -5,9 +5,10 @@ import type { FastifyReply, FastifyRequest } from "fastify";
 import type { Db } from "../db/index.js";
 import type { Bus } from "../realtime/bus.js";
 import type { VaultService } from "../vault/service.js";
+import { AvailabilityTracker, type AvailabilityRules } from "./availability.js";
 import { ExacqSource } from "./client.js";
 import { DemoSource } from "./demo.js";
-import type { Snapshot, SourceStatus, VideoSource } from "./types.js";
+import type { CameraInfo, Snapshot, SourceStatus, VideoSource } from "./types.js";
 
 export interface CameraRow {
   id: string;
@@ -23,7 +24,18 @@ export interface CameraRow {
   online: number;
   last_seen_at: number | null;
   sort_order: number;
+  /** Deshabilitada en el propio exacqVision: nunca alerta ni cuenta. */
+  vms_disabled: number;
+  alerts_muted_until: number | null;
+  offline_since: number | null;
+  /** Evento que hoy representa su caída (individual, agrupado, de servidor o de VPN). */
+  offline_event_id: number | null;
 }
+
+export type OfflineCamera = CameraRow & { reason: "signal" | "removed" };
+
+/** "Silenciada para siempre": 9999-12-31. */
+export const MUTE_FOREVER = 253402300799000;
 
 export interface ExacqServerRow {
   id: string;
@@ -75,6 +87,9 @@ export const publicCamera = (r: CameraRow, sourceName?: string, sourceKind?: str
   online: Boolean(r.online),
   lastSeenAt: r.last_seen_at,
   sortOrder: r.sort_order,
+  vmsDisabled: Boolean(r.vms_disabled),
+  alertsMutedUntil: r.alerts_muted_until && r.alerts_muted_until > Date.now() ? r.alerts_muted_until : null,
+  offlineSince: r.offline_since ?? null,
 });
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -85,6 +100,9 @@ export class CameraService {
   private snapTs = new Map<string, number>();
   readonly exports = new Map<string, ExportJob>();
   private syncTimer?: NodeJS.Timeout;
+  private tracker: AvailabilityTracker;
+  private now: () => number;
+  private syncing?: Promise<void>;
 
   constructor(
     private db: Db,
@@ -94,13 +112,28 @@ export class CameraService {
       demo: boolean;
       exportsDir: string;
       log: (msg: string) => void;
-      onCameraStatusChange?: (cam: CameraRow, online: boolean) => void;
+      /** Cámaras confirmadas sin señal en una misma sincronización de una fuente (con histéresis). */
+      onCamerasOffline?: (src: { id: string; name: string }, cams: OfflineCamera[]) => void;
+      onCamerasOnline?: (cams: CameraRow[]) => void;
+      /** Fuente confirmada caída: un único aviso por servidor, no uno por cámara. */
+      onSourceDown?: (src: { id: string; name: string }, affected: CameraRow[], err: string, since: number) => void;
+      onSourceUp?: (src: { id: string; name: string }, stillOffline: CameraRow[], downMs: number) => void;
+      /** Cámaras que pasaron a estar deshabilitadas en exacqVision. */
+      onVmsDisabled?: (cams: CameraRow[]) => void;
+      /** Reglas de histéresis vigentes (la app usa 3 sincronizaciones y 60 s). */
+      availability?: () => AvailabilityRules;
+      now?: () => number;
       /** Plantillas de video adoptadas por un servidor (para auditoría). */
       onTemplatesAdopted?: (server: { id: string; name: string }, t: { snapshot?: string; live?: string }, reason: "auto" | "detect") => void;
       onSourceStatus?: (sourceId: string, name: string, status: SourceStatus) => void;
     },
   ) {
     fs.mkdirSync(opts.exportsDir, { recursive: true });
+    this.now = opts.now ?? Date.now;
+    this.tracker = new AvailabilityTracker(
+      // Sin reglas explícitas no hay histéresis (comportamiento anterior); la app pasa las de settings.alerts.
+      opts.availability ?? (() => ({ cameraMinSyncs: 1, cameraAfterMs: 0, sourceMinSyncs: 1, sourceAfterMs: 0 })),
+    );
   }
 
   async start() {
@@ -165,83 +198,168 @@ export class CameraService {
     }
   }
 
-  /** Descubre cámaras de cada fuente y actualiza estado online/offline. */
-  async sync() {
-    const results = await Promise.allSettled(
-      [...this.sources.values()].map(async (src) => ({ src, cams: await src.listCameras() })),
-    );
-    const now = Date.now();
-    for (const r of results) {
-      if (r.status !== "fulfilled") continue;
-      const { src, cams } = r.value;
-      const seen = new Set<string>();
-      cams.forEach((c, idx) => {
-        const id = cameraKey(src.id, c.cameraId);
-        seen.add(id);
-        const prev = this.db.get<CameraRow>("SELECT * FROM cameras WHERE id = $id", { id });
-        if (!prev) {
-          const demoDefaults = src.kind === "demo" && ["1", "3", "7"].includes(c.cameraId);
-          this.db.run(
-            `INSERT INTO cameras(id, server_id, camera_id, name, enabled, motion_enabled, ai_verify, raw, online, last_seen_at, sort_order)
-             VALUES($id, $sid, $cid, $name, $enabled, $motion, 0, $raw, $online, $seen, $order)`,
-            {
-              id,
-              enabled: !c.disabled,
-              sid: src.id,
-              cid: c.cameraId,
-              name: c.name,
-              motion: demoDefaults,
-              raw: JSON.stringify(c.raw ?? null).slice(0, 20_000),
-              online: c.online,
-              seen: c.online ? now : null,
-              order: idx,
-            },
-          );
-          return;
-        }
-        // El nombre lo puede cambiar el administrador en CamerasIA: sólo se corrige si quedó vacío o
-        // difiere en espacios del que informa el VMS (versiones anteriores no los recortaban).
-        const fixName = !prev.name.trim() || (prev.name !== c.name && prev.name.trim().replace(/\s+/g, " ") === c.name);
-        this.db.run("UPDATE cameras SET name = $name, raw = $raw, online = $online, last_seen_at = COALESCE($seen, last_seen_at) WHERE id = $id", {
-          name: fixName ? c.name : prev.name,
-          raw: JSON.stringify(c.raw ?? null).slice(0, 20_000),
-          online: c.online,
-          seen: c.online ? now : null,
-          id,
-        });
-        if (Boolean(prev.online) !== c.online) {
-          const row = { ...prev, online: c.online ? 1 : 0 };
-          this.bus.publish("camera.status", publicCamera(row, src.name, src.kind));
-          this.opts.onCameraStatusChange?.(row, c.online);
-        }
+  /**
+   * Descubre cámaras de cada fuente y actualiza su estado con histéresis: una cámara (o un servidor) sólo
+   * se da por caída tras varias sincronizaciones seguidas y un tiempo mínimo; la recuperación es inmediata.
+   * Los avisos se entregan agrupados por fuente (una llamada por sincronización), nunca uno por cámara.
+   */
+  sync(): Promise<void> {
+    // Una sola sincronización a la vez (timer, VPN y rutas pueden pedirla juntas): las concurrentes comparten resultado.
+    this.syncing ??= this.runSync().finally(() => {
+      this.syncing = undefined;
+    });
+    return this.syncing;
+  }
+
+  private async runSync() {
+    const list = [...this.sources.values()];
+    // Hora de inicio: las sincronizaciones arrancan cada 30 s exactos, la respuesta puede demorar distinto.
+    const now = this.now();
+    const results = await Promise.allSettled(list.map((src) => src.listCameras()));
+    results.forEach((r, i) => {
+      const src = list[i]!;
+      // Se usa el resultado de ESTA sincronización (no status().ok, que un snapshot fallido puede alterar).
+      if (r.status === "rejected") this.sourceFailed(src, r.reason, now);
+      else this.sourceListed(src, r.value, now);
+    });
+  }
+
+  private publishStatus(row: CameraRow, src: VideoSource) {
+    this.bus.publish("camera.status", publicCamera(row, src.name, src.kind));
+  }
+
+  private sourceFailed(src: VideoSource, reason: unknown, now: number) {
+    const state = this.tracker.sourceFailed(src.id, now);
+    if (state !== "confirm_down") return;
+    const since = this.tracker.sourceFailingSince(src.id) ?? now;
+    const affected = this.db.all<CameraRow>("SELECT * FROM cameras WHERE server_id = $sid AND online = 1 AND vms_disabled = 0", { sid: src.id });
+    this.db.run("UPDATE cameras SET online = 0, offline_since = COALESCE(offline_since, $since) WHERE server_id = $sid AND online = 1 AND vms_disabled = 0", {
+      sid: src.id,
+      since,
+    });
+    const rows = affected.map((c) => ({ ...c, online: 0, offline_since: c.offline_since ?? since }));
+    for (const row of rows) this.publishStatus(row, src);
+    this.tracker.resetSource(src.id);
+    const err = reason instanceof Error ? reason.message : String(reason ?? "sin respuesta");
+    this.opts.onSourceDown?.({ id: src.id, name: src.name }, rows, err, since);
+  }
+
+  private sourceListed(src: VideoSource, cams: CameraInfo[], now: number) {
+    const downSince = this.tracker.sourceFailingSince(src.id);
+    const recovered = this.tracker.sourceOk(src.id) === "recovered";
+    const offline: OfflineCamera[] = [];
+    const online: CameraRow[] = [];
+    const disabled: CameraRow[] = [];
+    const seen = new Set<string>();
+
+    // Cámara sin señal (o ausente del listado): se confirma con histéresis. Sólo se informa si estaba en línea
+    // o si su caída todavía no está representada por ningún evento (p.ej. tras reponerse su servidor).
+    const observeOffline = (row: CameraRow, reason: OfflineCamera["reason"]) => {
+      if (this.tracker.cameraObserved(row.id, false, now) !== "confirm_offline") return;
+      if (!row.online && row.offline_event_id !== null) return;
+      const since = row.offline_since ?? this.tracker.firstOfflineAt(row.id) ?? now;
+      if (row.online) this.db.run("UPDATE cameras SET online = 0, offline_since = $since WHERE id = $id", { since, id: row.id });
+      const updated = { ...row, online: 0, offline_since: since };
+      if (row.online) this.publishStatus(updated, src);
+      offline.push({ ...updated, reason });
+    };
+
+    cams.forEach((c, idx) => {
+      const id = cameraKey(src.id, c.cameraId);
+      seen.add(id);
+      const dis = Boolean(c.disabled);
+      const prev = this.db.get<CameraRow>("SELECT * FROM cameras WHERE id = $id", { id });
+      if (!prev) {
+        // Visibilidad (enabled) es decisión del usuario; el estado en el VMS lo mantiene la sincronización.
+        const demoDefaults = src.kind === "demo" && ["1", "3", "7"].includes(c.cameraId);
+        this.db.run(
+          `INSERT INTO cameras(id, server_id, camera_id, name, enabled, motion_enabled, ai_verify, raw, online, last_seen_at, sort_order, vms_disabled)
+           VALUES($id, $sid, $cid, $name, 1, $motion, 0, $raw, $online, $seen, $order, $dis)`,
+          {
+            id,
+            sid: src.id,
+            cid: c.cameraId,
+            name: c.name,
+            motion: demoDefaults,
+            raw: JSON.stringify(c.raw ?? null).slice(0, 20_000),
+            online: c.online && !dis,
+            seen: c.online ? now : null,
+            order: idx,
+            dis,
+          },
+        );
+        if (!dis && !c.online) this.tracker.cameraObserved(id, false, now);
+        return;
+      }
+      // El nombre lo puede cambiar el administrador en CamerasIA: sólo se corrige si quedó vacío o
+      // difiere en espacios del que informa el VMS (versiones anteriores no los recortaban).
+      const fixName = !prev.name.trim() || (prev.name !== c.name && prev.name.trim().replace(/\s+/g, " ") === c.name);
+      this.db.run("UPDATE cameras SET name = $name, raw = $raw, vms_disabled = $dis WHERE id = $id", {
+        name: fixName ? c.name : prev.name,
+        raw: JSON.stringify(c.raw ?? null).slice(0, 20_000),
+        dis,
+        id,
       });
-      // Cámaras que desaparecieron del servidor → offline
-      for (const cam of this.db.all<CameraRow>("SELECT * FROM cameras WHERE server_id = $sid AND online = 1", { sid: src.id })) {
-        if (!seen.has(cam.id)) {
-          this.db.run("UPDATE cameras SET online = 0 WHERE id = $id", { id: cam.id });
-          this.opts.onCameraStatusChange?.({ ...cam, online: 0 }, false);
+      if (dis) {
+        // Deshabilitada en exacqVision: no se sigue su estado ni alerta. Al pasar a deshabilitada se cierra su caída.
+        if (!prev.vms_disabled) {
+          this.db.run("UPDATE cameras SET online = 0, offline_since = NULL, offline_event_id = NULL WHERE id = $id", { id });
+          this.tracker.reset(id);
+          disabled.push({ ...prev, vms_disabled: 1 });
+          this.publishStatus({ ...prev, vms_disabled: 1, online: 0, offline_since: null, offline_event_id: null }, src);
         }
+        return;
       }
+      const row = { ...prev, vms_disabled: 0 };
+      if (!c.online) return observeOffline(row, "signal");
+      this.tracker.cameraObserved(id, true, now);
+      this.db.run("UPDATE cameras SET online = 1, offline_since = NULL, last_seen_at = $now WHERE id = $id", { now, id });
+      if (!prev.online) {
+        const up = { ...row, online: 1, offline_since: null, last_seen_at: now };
+        this.publishStatus(up, src);
+        online.push(up);
+      }
+    });
+
+    // Cámaras que ya no figuran en el servidor → se tratan como sin señal (con la misma histéresis).
+    for (const cam of this.db.all<CameraRow>("SELECT * FROM cameras WHERE server_id = $sid AND vms_disabled = 0", { sid: src.id })) {
+      if (!seen.has(cam.id)) observeOffline(cam, "removed");
     }
-    // Fuentes que fallaron: sus cámaras quedan offline
-    const failed = [...this.sources.values()].filter((s) => !s.status().ok);
-    for (const src of failed) {
-      for (const cam of this.db.all<CameraRow>("SELECT * FROM cameras WHERE server_id = $sid AND online = 1", { sid: src.id })) {
-        this.db.run("UPDATE cameras SET online = 0 WHERE id = $id", { id: cam.id });
-        this.opts.onCameraStatusChange?.({ ...cam, online: 0 }, false);
-      }
+
+    const ref = { id: src.id, name: src.name };
+    if (disabled.length) this.opts.onVmsDisabled?.(disabled);
+    if (online.length) this.opts.onCamerasOnline?.(online);
+    if (offline.length) this.opts.onCamerasOffline?.(ref, offline);
+    if (recovered) {
+      const still = this.db.all<CameraRow>("SELECT * FROM cameras WHERE server_id = $sid AND online = 0 AND vms_disabled = 0", { sid: src.id });
+      this.opts.onSourceUp?.(ref, still, downSince ? now - downSince : 0);
     }
   }
 
-  list() {
+  /** Cámaras de las fuentes activas. Por defecto oculta las deshabilitadas en exacqVision. */
+  list(opts: { includeVmsDisabled?: boolean } = {}) {
     const activeSources = [...this.sources.keys()];
     return this.db
-      .all<CameraRow>("SELECT * FROM cameras ORDER BY sort_order, name")
+      .all<CameraRow>(`SELECT * FROM cameras ${opts.includeVmsDisabled ? "" : "WHERE vms_disabled = 0"} ORDER BY sort_order, name`)
       .filter((c) => activeSources.includes(c.server_id))
       .map((c) => {
         const src = this.sources.get(c.server_id)!;
         return publicCamera(c, src.name, src.kind);
       });
+  }
+
+  /** Silencia (o reactiva con `null`) las alertas de una cámara hasta el instante indicado. */
+  setMute(key: string, until: number | null) {
+    this.db.run("UPDATE cameras SET alerts_muted_until = $until WHERE id = $id", { until, id: key });
+    const row = this.row(key);
+    const src = row ? this.sources.get(row.server_id) : undefined;
+    if (row) this.bus.publish("camera.status", publicCamera(row, src?.name, src?.kind));
+    return row;
+  }
+
+  isMuted(key: string) {
+    const r = this.db.get<{ until: number | null }>("SELECT alerts_muted_until AS until FROM cameras WHERE id = $id", { id: key });
+    return Boolean(r?.until && r.until > this.now());
   }
 
   row(key: string) {

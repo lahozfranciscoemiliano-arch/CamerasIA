@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { Db } from "../src/db/index.js";
+import { Db, SCHEMA_VERSION } from "../src/db/index.js";
 
 // Fixture del esquema que ya existe en las VPS, antes del rol Tester.
 const LEGACY_SCHEMA = `
@@ -43,6 +43,48 @@ const LEGACY_SCHEMA = `
   );
   CREATE INDEX sessions_user ON sessions(user_id);
   CREATE TABLE audit_log (id INTEGER PRIMARY KEY, user_id INTEGER, action TEXT);
+  CREATE TABLE cameras (
+    id TEXT PRIMARY KEY,
+    server_id TEXT NOT NULL,
+    camera_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    zone TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    motion_enabled INTEGER NOT NULL DEFAULT 0,
+    ai_verify INTEGER NOT NULL DEFAULT 0,
+    sensitivity INTEGER NOT NULL DEFAULT 50,
+    raw TEXT,
+    online INTEGER NOT NULL DEFAULT 0,
+    last_seen_at INTEGER,
+    sort_order INTEGER NOT NULL DEFAULT 0
+  );
+  CREATE TABLE events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts INTEGER NOT NULL,
+    type TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    source TEXT NOT NULL,
+    camera_id TEXT,
+    title TEXT NOT NULL,
+    description TEXT,
+    snapshot TEXT,
+    ai TEXT,
+    status TEXT NOT NULL DEFAULT 'new',
+    assigned_to TEXT,
+    ack_by TEXT,
+    ack_at INTEGER,
+    resolved_by TEXT,
+    resolved_at INTEGER,
+    meta TEXT
+  );
+  CREATE TABLE event_notes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+    user_id INTEGER,
+    username TEXT,
+    ts INTEGER NOT NULL,
+    text TEXT NOT NULL
+  );
 `;
 
 function fixture() {
@@ -88,7 +130,7 @@ test("migración Tester conserva cuentas, MFA, sesiones y el máximo histórico 
     db = new Db(file);
     assert.deepEqual(plain(db.all("SELECT * FROM users ORDER BY id")), users);
     assert.deepEqual(plain(db.all("SELECT * FROM sessions ORDER BY id")), sessions);
-    assert.equal(db.get<{ value: string }>("SELECT value FROM meta WHERE key = 'schema_version'")?.value, "2");
+    assert.equal(db.get<{ value: string }>("SELECT value FROM meta WHERE key = 'schema_version'")?.value, String(SCHEMA_VERSION));
     assert.equal(db.get<{ user_id: number }>("SELECT user_id FROM audit_log WHERE id = 1")?.user_id, 1000);
     assert.equal(db.get<{ foreign_keys: number }>("PRAGMA foreign_keys")?.foreign_keys, 1);
     assert.deepEqual(db.all("PRAGMA foreign_key_check"), []);
@@ -174,10 +216,62 @@ test("una base nueva acepta Tester y mantiene las claves foráneas activas", () 
   try {
     db.run(`INSERT INTO users (username, role, password_hash, created_at, updated_at)
       VALUES ('Tester', 'tester', 'hash-test', 1, 1)`);
-    assert.equal(db.get<{ value: string }>("SELECT value FROM meta WHERE key = 'schema_version'")?.value, "2");
+    assert.equal(db.get<{ value: string }>("SELECT value FROM meta WHERE key = 'schema_version'")?.value, String(SCHEMA_VERSION));
     assert.equal(db.get<{ foreign_keys: number }>("PRAGMA foreign_keys")?.foreign_keys, 1);
     assert.deepEqual(db.all("PRAGMA foreign_key_check"), []);
   } finally {
     db.close();
+  }
+});
+
+test("migración 3 marca deshabilitadas en el VMS y cierra sus alertas", () => {
+  const { file, dir, raw } = fixture();
+  let db: Db | undefined;
+  try {
+    raw.exec(`
+      INSERT INTO cameras (id, server_id, camera_id, name, raw, online) VALUES
+        ('s:1', 's', '1', 'Deshabilitada 1', '{"id":1,"disabled":1}', 0),
+        ('s:2', 's', '2', 'Deshabilitada 2', '{"id":2,"enabled":false}', 0),
+        ('s:3', 's', '3', 'JSON truncado', '{"id":3,"disab', 0),
+        ('s:4', 's', '4', 'Normal', '{"id":4,"name":"Normal"}', 0);
+      INSERT INTO events (id, ts, type, severity, source, camera_id, title, status, meta) VALUES
+        (1, 1000, 'camera_offline', 'high', 'sistema', 's:1', 'sin señal 1', 'new', NULL),
+        (2, 1001, 'camera_offline', 'high', 'sistema', 's:2', 'sin señal 2', 'ack', NULL),
+        (3, 1002, 'camera_offline', 'high', 'sistema', 's:3', 'sin señal 3', 'new', NULL),
+        (4, 1003, 'camera_offline', 'high', 'sistema', 's:4', 'sin señal 4', 'new', NULL),
+        (5, 1004, 'camera_online', 'info', 'sistema', 's:4', 'volvió', 'new', NULL),
+        (6, 1005, 'host_down', 'high', 'noc', NULL, 'equipo caído', 'new', '{"hostId":"h1"}'),
+        (7, 1006, 'host_down', 'high', 'noc', NULL, 'meta inválida', 'new', '{"hostId":');
+    `);
+    raw.close();
+    db = new Db(file);
+    const vms = db.all<{ id: string; vms_disabled: number }>("SELECT id, vms_disabled FROM cameras ORDER BY id").map((r) => r.vms_disabled);
+    assert.deepEqual(vms, [1, 1, 0, 0]);
+    const ev = (id: number) => db!.get<Record<string, unknown>>("SELECT * FROM events WHERE id = $id", { id })!;
+    for (const id of [1, 2]) {
+      assert.equal(ev(id).status, "resolved");
+      assert.equal(ev(id).resolved_by, "sistema");
+      assert.equal(ev(id).ack_at, null, "no se falsea el MTTA");
+    }
+    assert.equal(ev(3).status, "new");
+    assert.equal(ev(4).status, "new");
+    assert.equal(ev(5).status, "resolved");
+    assert.equal(ev(5).silent, 1);
+    assert.equal(ev(4).dedupe_key, "camera_offline:s:4");
+    assert.equal(ev(6).dedupe_key, "host_down:h1");
+    assert.equal(ev(7).dedupe_key, null);
+    assert.equal(ev(4).last_ts, 1003);
+    assert.equal(ev(4).notified_at, 1003, "lo histórico no se vuelve a notificar");
+    assert.equal(db.get<{ e: number }>("SELECT offline_event_id AS e FROM cameras WHERE id = 's:4'")!.e, 4);
+    assert.equal(db.get<{ e: number | null }>("SELECT offline_event_id AS e FROM cameras WHERE id = 's:1'")!.e, null);
+    assert.equal(db.get<{ value: string }>("SELECT value FROM meta WHERE key = 'schema_version'")?.value, String(SCHEMA_VERSION));
+    db.close();
+    db = new Db(file);
+    assert.deepEqual(db.all<{ vms_disabled: number }>("SELECT vms_disabled FROM cameras ORDER BY id").map((r) => r.vms_disabled), [1, 1, 0, 0]);
+    assert.equal(db.get<{ n: number }>("SELECT COUNT(*) AS n FROM events")!.n, 7);
+  } finally {
+    db?.close();
+    closeFixture(raw);
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });

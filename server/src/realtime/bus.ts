@@ -3,6 +3,8 @@ import { EventEmitter } from "node:events";
 export type RealtimeTopic =
   | "event.new"
   | "event.update"
+  | "event.bulk"
+  | "alert.notify"
   | "vpn.status"
   | "vpn.log"
   | "camera.status"
