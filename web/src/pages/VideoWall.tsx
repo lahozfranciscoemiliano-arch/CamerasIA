@@ -1,5 +1,5 @@
 import { AnimatePresence, motion } from "framer-motion";
-import { ChevronLeft, ChevronRight, Expand, Grid2x2, Grid3x3, LayoutGrid, MonitorPlay, Pause, Play, Search, Square } from "lucide-react";
+import { Activity, ChevronLeft, ChevronRight, Expand, Grid2x2, Grid3x3, LayoutGrid, MonitorPlay, Pause, Play, Search, Square } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import CameraTile from "../components/CameraTile";
@@ -8,11 +8,13 @@ import { useApi, useLocalStorage } from "../lib/hooks";
 import { useTopic } from "../lib/realtime";
 import type { Camera } from "../lib/types";
 
+// Cuadros por segundo y prioridad por diseño: la vista individual es "focus" (más fps y prioridad
+// ante el servidor de video); las grillas reparten el ancho de banda entre más cámaras.
 const LAYOUTS = [
-  { n: 1, cols: "grid-cols-1", icon: <Square size={15} />, fps: 4 },
-  { n: 4, cols: "grid-cols-1 sm:grid-cols-2", icon: <Grid2x2 size={15} />, fps: 2 },
-  { n: 9, cols: "grid-cols-2 md:grid-cols-3", icon: <Grid3x3 size={15} />, fps: 1 },
-  { n: 16, cols: "grid-cols-2 md:grid-cols-4", icon: <LayoutGrid size={15} />, fps: 1 },
+  { n: 1, cols: "grid-cols-1", icon: <Square size={15} />, fps: 10, prio: "focus" as const },
+  { n: 4, cols: "grid-cols-1 sm:grid-cols-2", icon: <Grid2x2 size={15} />, fps: 4, prio: "grid" as const },
+  { n: 9, cols: "grid-cols-2 md:grid-cols-3", icon: <Grid3x3 size={15} />, fps: 3, prio: "grid" as const },
+  { n: 16, cols: "grid-cols-2 md:grid-cols-4", icon: <LayoutGrid size={15} />, fps: 2, prio: "grid" as const },
 ];
 
 export default function VideoWall() {
@@ -23,6 +25,7 @@ export default function VideoWall() {
   const [onlyOnline, setOnlyOnline] = useLocalStorage("cia.wall.online", false);
   const [page, setPage] = useState(0);
   const [tour, setTour] = useState(false);
+  const [showStats, setShowStats] = useLocalStorage("cia.wall.stats", false);
   const wallRef = useRef<HTMLDivElement>(null);
   const focused = params.get("cam");
 
@@ -74,6 +77,9 @@ export default function VideoWall() {
                 </button>
               ))}
             </div>
+            <button className={`btn btn-sm ${showStats ? "btn-primary" : ""}`} onClick={() => setShowStats(!showStats)} title="Mostrar fps, latencia y resolución">
+              <Activity size={14} />
+            </button>
             <button className={`btn btn-sm ${tour ? "btn-primary" : ""}`} onClick={() => setTour(!tour)} title="Ronda automática">
               {tour ? <Pause size={14} /> : <Play size={14} />} Ronda
             </button>
@@ -89,7 +95,17 @@ export default function VideoWall() {
           <AnimatePresence mode="wait">
             <motion.div key={`${page}-${layoutN}`} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className={`grid ${layout.cols} gap-2`}>
               {current.map((c) => (
-                <CameraTile key={c.id} camera={c} fps={layout.fps} mode={layout.n === 1 ? "stream" : "poll"} big={layout.n <= 4} onExpand={() => setParams({ cam: c.id })} />
+                <CameraTile
+                  key={c.id}
+                  camera={c}
+                  fps={layout.fps}
+                  prio={layout.prio}
+                  // Con la vista ampliada abierta, la grilla de atrás no pide video.
+                  paused={Boolean(focusCam)}
+                  showStats={showStats}
+                  big={layout.n <= 4}
+                  onExpand={() => setParams({ cam: c.id })}
+                />
               ))}
             </motion.div>
           </AnimatePresence>
@@ -127,7 +143,7 @@ export default function VideoWall() {
                   Cerrar (Esc)
                 </button>
               </div>
-              <CameraTile camera={focusCam} fps={4} mode="stream" big />
+              <CameraTile camera={focusCam} fps={10} prio="focus" fit="contain" showStats={showStats} big />
             </motion.div>
           </motion.div>
         )}

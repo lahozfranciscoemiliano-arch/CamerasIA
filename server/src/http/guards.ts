@@ -77,3 +77,22 @@ export function makeGuard(auth: AuthService, cfg: AppConfig) {
 export type Guard = ReturnType<typeof makeGuard>;
 
 export const clientIp = (req: FastifyRequest) => req.ip;
+
+/**
+ * ¿El Origin de la solicitud es el propio sitio (o uno de ALLOWED_ORIGINS)? El host de referencia
+ * es X-Forwarded-Host (primer valor) detrás de un proxy de confianza; si no, Host.
+ * Sin Origin: se acepta salvo `required` (WebSocket de video). "null" u orígenes inválidos: no.
+ */
+export function isAllowedOrigin(req: FastifyRequest, cfg: AppConfig, opts: { required?: boolean } = {}): boolean {
+  const origin = req.headers.origin;
+  if (!origin) return !opts.required;
+  if (cfg.allowedOrigins.includes(origin)) return true;
+  const fwd = cfg.TRUST_PROXY ? req.headers["x-forwarded-host"] : undefined;
+  const host = fwd ? String(Array.isArray(fwd) ? fwd[0] : fwd).split(",")[0]!.trim() : req.headers.host;
+  if (!host) return false;
+  try {
+    return new URL(origin).host === host;
+  } catch {
+    return false;
+  }
+}

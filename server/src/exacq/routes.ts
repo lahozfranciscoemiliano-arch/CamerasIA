@@ -5,7 +5,9 @@ import type { AppCtx } from "../context.js";
 import { HttpError, clientIp } from "../http/guards.js";
 import { ExacqSource, normalizeBaseUrl } from "./client.js";
 import { diagnosticConfig } from "./diagnostics.js";
+import { EXTRA_RE, manualProfile, publicLiveProfile, type LiveProfile } from "./live-profile.js";
 import { publicCamera, type ExacqServerRow } from "./service.js";
+import { tierFor } from "../live/protocol.js";
 
 const PatchCamera = z.object({
   name: z.string().min(1).max(80).optional(),
@@ -49,9 +51,17 @@ const ServerBody = z.object({
   liveTemplate: template.nullable().optional(),
   vpnProfileId: z.string().nullable().optional(),
   timezone: z.string().max(64).nullable().optional(),
+  /** Perfil de video en vivo manual (sólo PATCH): parámetros extra de tamaño y calidad; null lo borra. */
+  liveProfile: z
+    .object({
+      resize: z.object({ extra: z.string().regex(EXTRA_RE, "Parámetros de tamaño inválidos") }).nullable().optional(),
+      quality: z.object({ extra: z.string().regex(EXTRA_RE, "Parámetros de calidad inválidos") }).nullable().optional(),
+    })
+    .nullable()
+    .optional(),
 });
 
-const publicServer = (s: ExacqServerRow) => ({
+const publicServer = (s: ExacqServerRow, liveProfile: LiveProfile | null = null) => ({
   id: s.id,
   name: s.name,
   baseUrl: s.base_url,
@@ -63,6 +73,7 @@ const publicServer = (s: ExacqServerRow) => ({
   timezone: s.timezone,
   lastOkAt: s.last_ok_at,
   lastError: s.last_error,
+  liveProfile: publicLiveProfile(liveProfile),
 });
 
 export function registerCameraRoutes(app: FastifyInstance, ctx: AppCtx) {
@@ -97,8 +108,22 @@ export function registerCameraRoutes(app: FastifyInstance, ctx: AppCtx) {
     return publicCamera(cameras.row(row.id)!, src?.name, src?.kind);
   });
 
-  app.get<{ Params: { key: string } }>("/api/cameras/:key/snapshot", { config: { rateLimit: { max: 6000, timeWindow: "1 minute" } } }, async (req, reply) => {
+  app.get<{ Params: { key: string }; Querystring: { w?: string; fps?: string } }>("/api/cameras/:key/snapshot", { config: { rateLimit: { max: 6000, timeWindow: "1 minute" } } }, async (req, reply) => {
     guard(req);
+    const w = Number(req.query.w);
+    if (cameras.live && Number.isFinite(w) && w > 0) {
+      // Visor en vivo por HTTP (respaldo del WebSocket): comparte el lazo de la cámara en el hub y
+      // recibe un cuadro del ancho pedido. Errores genéricos: no se expone la URL interna del exacq.
+      const fps = Math.min(Math.max(Number(req.query.fps) || 1, 0.2), 10);
+      try {
+        const f = await cameras.live.pull(req.params.key, { tierW: tierFor(w), fps, maxAgeMs: Math.max(200, 1000 / fps), timeoutMs: 4000 });
+        reply.header("Cache-Control", "no-store").header("X-Frame-Size", `${f.w}x${f.h}`).header("X-Frame-Age", String(Math.max(0, Math.round(Date.now() - f.tCap)))).type("image/jpeg");
+        return f.data;
+      } catch (e) {
+        const status = (e as { statusCode?: number }).statusCode ?? 502;
+        throw new HttpError(status, status === 404 ? "Cámara inexistente" : "Sin imagen de la cámara", "snapshot_failed");
+      }
+    }
     try {
       const snap = await cameras.snapshot(req.params.key);
       reply.header("Cache-Control", "no-store").type(snap.contentType);
@@ -108,9 +133,9 @@ export function registerCameraRoutes(app: FastifyInstance, ctx: AppCtx) {
     }
   });
 
-  app.get<{ Params: { key: string }; Querystring: { fps?: string } }>("/api/cameras/:key/stream", async (req, reply) => {
+  app.get<{ Params: { key: string }; Querystring: { fps?: string; w?: string } }>("/api/cameras/:key/stream", async (req, reply) => {
     guard(req);
-    await cameras.stream(req.params.key, req, reply, Number(req.query.fps ?? 2));
+    await cameras.stream(req.params.key, req, reply, Number(req.query.fps ?? 2), { tierW: tierFor(Number(req.query.w)) });
   });
 
   app.get<{ Params: { key: string }; Querystring: { start?: string; speed?: string } }>("/api/cameras/:key/replay", async (req, reply) => {
@@ -175,7 +200,7 @@ export function registerCameraRoutes(app: FastifyInstance, ctx: AppCtx) {
   // ───────── Servidores exacqVision (administración y diagnósticos) ─────────
   app.get("/api/exacq/servers", async (req) => {
     guard(req, { role: "tester" });
-    return cameras.servers().map(publicServer);
+    return cameras.servers().map((s) => publicServer(s, cameras.liveProfile(s.id)));
   });
 
   app.get("/api/exacq/status", async (req) => {
@@ -185,7 +210,7 @@ export function registerCameraRoutes(app: FastifyInstance, ctx: AppCtx) {
 
   app.post("/api/exacq/servers", async (req) => {
     const a = guard(req, { role: "admin", stepUp: true });
-    const b = ServerBody.parse(req.body);
+    const { liveProfile: _ignored, ...b } = ServerBody.parse(req.body);
     const id = crypto.randomUUID();
     const now = Date.now();
     db.run(
@@ -204,6 +229,14 @@ export function registerCameraRoutes(app: FastifyInstance, ctx: AppCtx) {
     const cur = db.get<ExacqServerRow>("SELECT * FROM exacq_servers WHERE id = $id", { id: req.params.id });
     if (!cur) throw new HttpError(404, "Servidor inexistente", "not_found");
     const b = ServerBody.partial().parse(req.body);
+    // Perfil de video en vivo: manual (nunca se reemplaza solo) o null para volver a probarlo.
+    if (b.liveProfile !== undefined) {
+      const prev = cameras.liveProfile(cur.id);
+      cameras.setLiveProfile(cur.id, b.liveProfile ? manualProfile(b.liveProfile, prev) : null);
+    } else if (b.snapshotTemplate !== undefined && b.snapshotTemplate !== cur.snapshot_template && cameras.liveProfile(cur.id)?.source !== "manual") {
+      // Los parámetros se verificaron con la URL anterior.
+      cameras.setLiveProfile(cur.id, null);
+    }
     db.run(
       `UPDATE exacq_servers SET name = $name, base_url = $url, credential_id = $cred, enabled = $enabled, snapshot_template = $snap,
        live_template = $live, vpn_profile_id = $vpn, timezone = $tz, updated_at = $now WHERE id = $id`,
@@ -223,7 +256,7 @@ export function registerCameraRoutes(app: FastifyInstance, ctx: AppCtx) {
     audit.log({ userId: a.user.id, username: a.user.username, action: "exacq.server_update", target: cur.name, ip: clientIp(req), details: b });
     await cameras.reload();
     void cameras.sync().catch(() => undefined);
-    return publicServer(db.get<ExacqServerRow>("SELECT * FROM exacq_servers WHERE id = $id", { id: cur.id })!);
+    return publicServer(db.get<ExacqServerRow>("SELECT * FROM exacq_servers WHERE id = $id", { id: cur.id })!, cameras.liveProfile(cur.id));
   });
 
   app.delete<{ Params: { id: string } }>("/api/exacq/servers/:id", async (req) => {
@@ -234,6 +267,7 @@ export function registerCameraRoutes(app: FastifyInstance, ctx: AppCtx) {
       db.run("DELETE FROM cameras WHERE server_id = $id", { id: cur.id });
       db.run("DELETE FROM exacq_servers WHERE id = $id", { id: cur.id });
     });
+    cameras.setLiveProfile(cur.id, null);
     audit.log({ userId: a.user.id, username: a.user.username, action: "exacq.server_delete", target: cur.name, ip: clientIp(req) });
     await cameras.reload();
     return { ok: true };

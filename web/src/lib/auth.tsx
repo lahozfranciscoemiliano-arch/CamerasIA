@@ -1,5 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
 import { api, setUnauthorizedHandler } from "./api";
+import { liveClient } from "./live";
 import type { Me, Role } from "./types";
 
 interface AuthCtx {
@@ -30,11 +31,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     void refresh();
-    setUnauthorizedHandler(() => setMe(null));
+    setUnauthorizedHandler(() => {
+      liveClient.shutdown();
+      setMe(null);
+    });
     return () => setUnauthorizedHandler(null);
   }, [refresh]);
 
   const logout = useCallback(async () => {
+    liveClient.shutdown();
     await api.post("/api/auth/logout").catch(() => undefined);
     setMe(null);
   }, []);

@@ -16,6 +16,23 @@ export interface Snapshot {
   data: Buffer;
   contentType: string;
   ts: number;
+  /** Tamaño del cuadro (si se leyó de la cabecera JPEG). */
+  width?: number;
+  height?: number;
+}
+
+/** Opciones de un cuadro: calidad/tamaño pedidos al servidor (si los soporta) y cancelación. */
+export interface SnapshotOpts {
+  quality?: number;
+  width?: number;
+  height?: number;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  /**
+   * Cuadro de video en vivo (LiveHub): aplica el perfil de video en vivo del servidor y sus fallas
+   * no cambian el estado del servidor (son muchas y transitorias).
+   */
+  live?: boolean;
 }
 
 export interface LiveStream {
@@ -37,7 +54,7 @@ export interface VideoSource {
   readonly name: string;
   readonly kind: "exacq" | "demo";
   listCameras(): Promise<CameraInfo[]>;
-  snapshot(cameraId: string, opts?: { quality?: number }): Promise<Snapshot>;
+  snapshot(cameraId: string, opts?: SnapshotOpts): Promise<Snapshot>;
   /** Stream MJPEG nativo si la fuente lo soporta (si no, se sintetiza a partir de snapshots). */
   liveStream?(cameraId: string): Promise<LiveStream | null>;
   searchRecordings(cameraId: string, start: Date, end: Date): Promise<Clip[]>;

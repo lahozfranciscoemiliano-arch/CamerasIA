@@ -2,6 +2,7 @@ import { motion } from "framer-motion";
 import { ArrowDownToLine, ArrowUpFromLine, Building2, Cloud, Edit3, Lock, Network, Plug, PlugZap, Plus, Server, ShieldAlert, ShieldCheck, Terminal, Trash2, Unplug } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Sparkline } from "../components/charts";
+import LiveVideoPanel from "../components/LiveVideoPanel";
 import { useToast } from "../components/toasts";
 import { Dot, Empty, ErrorNote, Field, Modal, PageHeader, Panel, Spinner, Toggle } from "../components/ui";
 import { api, ApiError } from "../lib/api";
@@ -472,6 +473,8 @@ export default function Connectivity() {
           )}
         </Panel>
       </div>
+
+      {can("tester") && <LiveVideoPanel />}
 
       <ProfileModal profile={editing} open={can("admin") && modalOpen} onClose={() => setModalOpen(false)} onSaved={() => void reloadProfiles()} />
     </div>

@@ -16,7 +16,7 @@ import { AuditService } from "./audit/service.js";
 import { loadKeyRing } from "./security/crypto.js";
 import { VaultService } from "./vault/service.js";
 import { AuthError, AuthService } from "./auth/service.js";
-import { HttpError, makeGuard } from "./http/guards.js";
+import { HttpError, isAllowedOrigin, makeGuard } from "./http/guards.js";
 import { CameraService } from "./exacq/service.js";
 import { EventService } from "./events/service.js";
 import { VpnManager } from "./vpn/manager.js";
@@ -33,6 +33,9 @@ import { registerEventRoutes } from "./events/routes.js";
 import { registerAiRoutes } from "./ai/routes.js";
 import { registerHealthRoutes } from "./health/routes.js";
 import { registerRealtime } from "./realtime/ws.js";
+import { LiveHub, liveCfgFrom } from "./live/hub.js";
+import { registerLive } from "./live/ws.js";
+import { LiveProfiles } from "./exacq/live-probe.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -118,10 +121,28 @@ export async function buildApp(cfg: AppConfig, opts: { logger?: boolean } = {}):
     },
   });
 
-  const detection = new DetectionEngine(db, cameras, events, ai, { intervalMs: 2000, cooldownMs: cfg.DEMO_MODE ? 120_000 : 60_000, log });
+  // Video en vivo: perfil de tamaño/calidad por servidor exacq y hub de lazos compartidos por cámara.
+  const liveProfiles = new LiveProfiles(cameras, {
+    log,
+    onSaved: (server, p, reason) => {
+      // La prueba pedida por un administrador la audita la ruta con su usuario.
+      if (reason === "auto") {
+        audit.log({
+          username: "sistema",
+          action: "exacq.live_profile",
+          target: server.name,
+          details: { reason, resize: p.resize?.extra ?? null, quality: p.quality?.extra ?? null, concurrency: p.recommendedConcurrency },
+        });
+      }
+    },
+  });
+  const live = cfg.LIVE_ENABLED ? new LiveHub(cameras, bus, liveCfgFrom(cfg), { ensureProfile: (id) => liveProfiles.ensure(id) }) : null;
+  cameras.live = live;
+
+  const detection = new DetectionEngine(db, cameras, events, ai, { intervalMs: 2000, cooldownMs: cfg.DEMO_MODE ? 120_000 : 60_000, log, live });
   const demoSim = cfg.DEMO_MODE ? new DemoSimulator(db, cameras, events) : null;
 
-  const ctx: AppCtx = { cfg, db, bus, audit, vault, auth, guard, cameras, events, vpn, health, ai, detection, log };
+  const ctx: AppCtx = { cfg, db, bus, audit, vault, auth, guard, cameras, events, vpn, health, ai, detection, live, liveProfiles, log };
 
   // ───────── Plugins de seguridad ─────────
   await app.register(cookie);
@@ -164,17 +185,7 @@ export async function buildApp(cfg: AppConfig, opts: { logger?: boolean } = {}):
   app.addHook("onRequest", async (req) => {
     if (!req.url.startsWith("/api/") || ["GET", "HEAD", "OPTIONS"].includes(req.method) || req.url.startsWith("/api/ingest/")) return;
     if (req.headers["x-requested-with"] !== "CamerasIA") throw new HttpError(403, "Solicitud rechazada (CSRF)", "csrf");
-    const origin = req.headers.origin;
-    if (origin) {
-      const host = req.headers["x-forwarded-host"] && cfg.TRUST_PROXY ? String(req.headers["x-forwarded-host"]) : req.headers.host;
-      let ok = false;
-      try {
-        ok = new URL(origin).host === host || cfg.allowedOrigins.includes(origin);
-      } catch {
-        ok = false;
-      }
-      if (!ok) throw new HttpError(403, "Origen no permitido", "csrf");
-    }
+    if (!isAllowedOrigin(req, cfg)) throw new HttpError(403, "Origen no permitido", "csrf");
   });
 
   app.addHook("onSend", async (req, reply) => {
@@ -204,6 +215,7 @@ export async function buildApp(cfg: AppConfig, opts: { logger?: boolean } = {}):
   registerAiRoutes(app, ctx);
   registerHealthRoutes(app, ctx);
   registerRealtime(app, ctx);
+  registerLive(app, ctx);
   app.get("/api/ping", async () => ({ ok: true, ts: Date.now() }));
 
   // ───────── Frontend (SPA) ─────────
@@ -231,6 +243,7 @@ export async function buildApp(cfg: AppConfig, opts: { logger?: boolean } = {}):
     demoSim?.stop();
     health.stop();
     vpn.stop();
+    live?.stop();
     cameras.stop();
     await app.close();
     db.close();

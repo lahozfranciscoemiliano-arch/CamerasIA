@@ -2,6 +2,7 @@ import type { Db } from "../db/index.js";
 import type { CameraRow, CameraService } from "../exacq/service.js";
 import type { EventService, EventType, Severity } from "../events/service.js";
 import type { AiService, VisionResult } from "../ai/service.js";
+import type { LiveHub } from "../live/hub.js";
 import { compareGrids, lumaGrid } from "./motion.js";
 
 const THREAT_TO_SEVERITY: Record<VisionResult["threat_level"], Severity> = {
@@ -32,7 +33,13 @@ export class DetectionEngine {
     private cameras: CameraService,
     private events: EventService,
     private ai: AiService,
-    private opts: { intervalMs: number; cooldownMs: number; log: (m: string) => void },
+    private opts: {
+      intervalMs: number;
+      cooldownMs: number;
+      log: (m: string) => void;
+      /** Si está, el movimiento se analiza con cuadros de 640 px del LiveHub (compartidos con los visores). */
+      live?: LiveHub | null;
+    },
   ) {}
 
   start() {
@@ -55,8 +62,12 @@ export class DetectionEngine {
   private async process(cam: CameraRow) {
     this.busy.add(cam.id);
     try {
-      const snap = await this.cameras.snapshot(cam.id, this.opts.intervalMs * 0.75);
-      const grid = lumaGrid(snap.data);
+      // Movimiento: cuadro reducido (640 px) del hub; decodificarlo cuesta ~5 veces menos que uno de
+      // resolución completa y comparte el pedido con quien esté mirando la cámara.
+      const frame = this.opts.live
+        ? (await this.opts.live.pull(cam.id, { tierW: 640, fps: 0.5, maxAgeMs: 1500, timeoutMs: 4000 })).data
+        : (await this.cameras.snapshot(cam.id, this.opts.intervalMs * 0.75)).data;
+      const grid = lumaGrid(frame);
       this.stats.framesAnalyzed++;
       const prev = this.prev.get(cam.id);
       this.prev.set(cam.id, grid);
@@ -66,6 +77,7 @@ export class DetectionEngine {
 
       if (r.tamper && now - (this.lastEvent.get(`${cam.id}:tamper`) ?? 0) > 5 * 60_000) {
         this.lastEvent.set(`${cam.id}:tamper`, now);
+        const evidence = await this.evidence(cam.id, frame);
         this.events.create({
           type: "tamper",
           severity: "high",
@@ -73,7 +85,7 @@ export class DetectionEngine {
           cameraId: cam.id,
           title: `Posible sabotaje: imagen obstruida en ${cam.name}`,
           description: "La escena perdió detalle de forma abrupta (cámara tapada, cegada o movida).",
-          snapshot: snap.data,
+          snapshot: evidence,
         });
         return;
       }
@@ -90,6 +102,7 @@ export class DetectionEngine {
       this.lastEvent.set(cam.id, now);
       this.pendingMotion.delete(cam.id);
       this.stats.motionEvents++;
+      const evidence = await this.evidence(cam.id, frame);
 
       const ev = this.events.create({
         type: "motion",
@@ -98,18 +111,28 @@ export class DetectionEngine {
         cameraId: cam.id,
         title: `Movimiento detectado en ${cam.name}`,
         description: `Cambio en ${(r.changedFraction * 100).toFixed(1)}% de la imagen.`,
-        snapshot: snap.data,
+        snapshot: evidence,
         meta: { changedFraction: r.changedFraction, box: r.box },
       });
 
       if (cam.ai_verify && this.ai.available() && this.ai.settings().autoVerify) {
-        void this.verify(ev.id, cam, snap.data);
+        void this.verify(ev.id, cam, evidence);
       }
     } catch (e) {
       this.stats.errors++;
       if (this.ticks % 30 === 0) this.opts.log(`detección ${cam.name}: ${(e as Error).message}`);
     } finally {
       this.busy.delete(cam.id);
+    }
+  }
+
+  /** Imagen de evidencia a resolución completa (para el evento y la IA); si falla, el cuadro analizado. */
+  private async evidence(key: string, fallback: Buffer): Promise<Buffer> {
+    if (!this.opts.live) return fallback;
+    try {
+      return (await this.cameras.snapshot(key, 1500)).data;
+    } catch {
+      return fallback;
     }
   }
 

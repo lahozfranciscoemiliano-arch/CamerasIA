@@ -141,7 +141,7 @@ export default function Dashboard() {
         >
           <div className="grid grid-cols-2 gap-2">
             {featured.map((c) => (
-              <CameraTile key={c.id} camera={c} fps={1} onExpand={() => navigate(`/video?cam=${encodeURIComponent(c.id)}`)} />
+              <CameraTile key={c.id} camera={c} fps={2} prio="grid" onExpand={() => navigate(`/video?cam=${encodeURIComponent(c.id)}`)} />
             ))}
             {!featured.length && <Empty icon={<Cctv />} title="Sin cámaras en línea" />}
           </div>

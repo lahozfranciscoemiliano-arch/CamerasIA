@@ -1,51 +1,65 @@
 import { AnimatePresence, motion } from "framer-motion";
 import { Camera as CameraIcon, Maximize2, ScanEye, Sparkles, VideoOff, X } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../lib/api";
 import { useAuth } from "../lib/auth";
 import { fmtTime } from "../lib/format";
+import type { Prio } from "../lib/live-protocol";
 import type { Camera, Severity, VisionResult } from "../lib/types";
+import { useLiveCanvas } from "../lib/useLive";
 import { SeverityBadge, Spinner } from "./ui";
 
 /**
- * Imagen en vivo. Modo "poll": pide snapshots secuenciales (evita agotar las 6 conexiones HTTP/1.1
- * del navegador cuando hay muchas cámaras). Modo "stream": MJPEG continuo (vista individual).
+ * Respaldo HTTP del video en vivo (cuando el WebSocket no está disponible): pide cuadros del ancho
+ * del recuadro (?w=) de a uno, sólo mientras la vista está activa, con tiempo máximo de 4 s y una
+ * espera corta ante errores. Un cuadro lento no muestra "SIN SEÑAL": hacen falta varios errores seguidos.
  */
-export function LiveImage({ camera, fps, mode, className = "" }: { camera: Camera; fps: number; mode: "poll" | "stream"; className?: string }) {
+export function LiveImage({ camera, fps, active = true, maxW = 640, className = "" }: { camera: Camera; fps: number; active?: boolean; maxW?: number; className?: string; mode?: "poll" | "stream" }) {
   const [src, setSrc] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
-  const [retryKey, setRetryKey] = useState(0);
   const prevUrl = useRef<string | null>(null);
   const base = `/api/cameras/${encodeURIComponent(camera.id)}`;
 
   useEffect(() => {
-    if (mode !== "poll") return;
+    if (!active) return;
     let stopped = false;
     let timer: ReturnType<typeof setTimeout>;
+    let errors = 0;
+    let ac: AbortController | null = null;
     const loop = async () => {
       const t0 = performance.now();
+      ac = new AbortController();
+      const timeout = setTimeout(() => ac?.abort(), 4000);
       try {
-        const res = await fetch(`${base}/snapshot`, { credentials: "same-origin" });
+        const res = await fetch(`${base}/snapshot?w=${maxW}&fps=${fps}`, { credentials: "same-origin", signal: ac.signal });
         if (!res.ok) throw new Error(String(res.status));
         const url = URL.createObjectURL(await res.blob());
+        // Decodificar antes de reemplazar: el cambio de imagen no parpadea.
+        const img = new Image();
+        img.src = url;
+        await img.decode().catch(() => undefined);
         if (stopped) return URL.revokeObjectURL(url);
         setSrc(url);
         setFailed(false);
+        errors = 0;
         if (prevUrl.current) URL.revokeObjectURL(prevUrl.current);
         prevUrl.current = url;
         timer = setTimeout(loop, Math.max(80, 1000 / fps - (performance.now() - t0)));
       } catch {
         if (stopped) return;
-        setFailed(true);
-        timer = setTimeout(loop, 5000);
+        if (++errors >= 3) setFailed(true);
+        timer = setTimeout(loop, Math.min(2000, 750 * errors));
+      } finally {
+        clearTimeout(timeout);
       }
     };
     void loop();
     return () => {
       stopped = true;
       clearTimeout(timer);
+      ac?.abort();
     };
-  }, [base, fps, mode]);
+  }, [base, fps, active, maxW]);
 
   useEffect(
     () => () => {
@@ -54,16 +68,76 @@ export function LiveImage({ camera, fps, mode, className = "" }: { camera: Camer
     [],
   );
 
-  if (mode === "stream") {
-    return failed ? (
-      <NoSignal onRetry={() => (setFailed(false), setRetryKey((k) => k + 1))} />
-    ) : (
-      <img key={retryKey} src={`${base}/stream?fps=${fps}&k=${retryKey}`} alt={camera.name} className={`w-full h-full object-cover ${className}`} onError={() => setFailed(true)} />
-    );
-  }
   if (failed && !src) return <NoSignal />;
   return src ? <img src={src} alt={camera.name} className={`w-full h-full object-cover ${failed ? "grayscale opacity-40" : ""} ${className}`} /> : <div className="w-full h-full skeleton" />;
 }
+
+/** Reloj del recuadro: sólo este componente se vuelve a dibujar cada segundo. */
+function TileClock() {
+  const [clock, setClock] = useState(Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setClock(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+  return <span className="ml-auto font-mono text-ink-2">{fmtTime(clock)}</span>;
+}
+
+/** Video en vivo sobre <canvas> (WebSocket /api/live) con respaldo HTTP. */
+const LiveView = memo(function LiveView({
+  camera,
+  fps,
+  prio,
+  paused,
+  fit,
+  showStats,
+}: {
+  camera: Camera;
+  fps: number;
+  prio: Prio;
+  paused: boolean;
+  fit: "cover" | "contain";
+  showStats: boolean;
+}) {
+  const live = useLiveCanvas(camera, { fps, prio, paused, fit });
+  const st = live.stats;
+  const warn = Boolean(st && ((st.latencyMs ?? 0) > 1500 || st.limited));
+  return (
+    <div ref={live.containerRef} className="relative w-full h-full">
+      {live.mode === "fallback" ? (
+        <LiveImage camera={camera} fps={Math.min(fps, 4)} active={live.active} maxW={live.maxW} />
+      ) : (
+        <>
+          <canvas
+            ref={live.canvasRef}
+            aria-label={camera.name}
+            className={`block w-full h-full transition-[filter] ${live.view === "stalled" ? "grayscale-[.6] brightness-75" : ""}`}
+          />
+          {live.view === "loading" && <div className="absolute inset-0 skeleton" />}
+          {live.view === "stalled" && (
+            <div className="absolute inset-0 grid place-items-center pointer-events-none">
+              <span className="flex items-center gap-2 rounded-md bg-black/70 px-3 py-1.5 text-xs text-ink-2">
+                <Spinner size={13} /> Reconectando…
+              </span>
+            </div>
+          )}
+          {live.view === "nosignal" && (
+            <div className="absolute inset-0">
+              <NoSignal />
+            </div>
+          )}
+        </>
+      )}
+      {showStats && st && live.mode !== "fallback" && (
+        <span
+          className={`absolute left-2 bottom-2 rounded px-1.5 py-0.5 font-mono text-[10px] pointer-events-none ${warn ? "bg-warn/25 text-warn" : "bg-black/70 text-ink-2"}`}
+          title={`Descartados: ${st.dropped}${st.limited ? " · limitado por ancho de banda" : ""}`}
+        >
+          {st.fps.toFixed(1)} fps · {st.latencyMs ?? "-"} ms · {st.width}×{st.height}
+        </span>
+      )}
+    </div>
+  );
+});
 
 function NoSignal({ onRetry }: { onRetry?: () => void }) {
   return (
@@ -122,13 +196,24 @@ export function AiResultCard({ result, onClose, compact = false }: { result: Vis
 export default function CameraTile({
   camera,
   fps = 1,
-  mode = "poll",
+  prio = "grid",
+  paused = false,
+  fit = "cover",
+  showStats = false,
   onExpand,
   big = false,
 }: {
   camera: Camera;
   fps?: number;
+  /** @deprecated El video en vivo usa siempre el WebSocket /api/live (con respaldo HTTP). */
   mode?: "poll" | "stream";
+  /** "focus": vista ampliada (más fps y prioridad ante el servidor de video). */
+  prio?: Prio;
+  /** Pausa el video (p. ej. la grilla mientras está abierta la vista ampliada). */
+  paused?: boolean;
+  fit?: "cover" | "contain";
+  /** Muestra fps · latencia · resolución. */
+  showStats?: boolean;
   onExpand?: () => void;
   big?: boolean;
 }) {
@@ -137,12 +222,6 @@ export default function CameraTile({
   const [aiBusy, setAiBusy] = useState(false);
   const [aiError, setAiError] = useState("");
   const [flash, setFlash] = useState(false);
-  const [clock, setClock] = useState(Date.now());
-
-  useEffect(() => {
-    const t = setInterval(() => setClock(Date.now()), 1000);
-    return () => clearInterval(t);
-  }, []);
 
   const analyze = async () => {
     setAiBusy(true);
@@ -173,7 +252,7 @@ export default function CameraTile({
 
   return (
     <div className={`group relative rounded-lg overflow-hidden border bg-black aspect-video ${camera.online ? "border-line" : "border-crit/50"}`}>
-      {camera.online ? <LiveImage camera={camera} fps={fps} mode={mode} /> : <NoSignal />}
+      {camera.online ? <LiveView camera={camera} fps={fps} prio={prio} paused={paused} fit={fit} showStats={showStats} /> : <NoSignal />}
       <div className="scanline absolute inset-0 pointer-events-none" />
       <div className="absolute inset-0 pointer-events-none hud-corners opacity-0 group-hover:opacity-100 transition-opacity" />
       {flash && <div className="absolute inset-0 bg-white/60" />}
@@ -198,7 +277,7 @@ export default function CameraTile({
             <Sparkles size={13} />
           </span>
         )}
-        <span className="ml-auto font-mono text-ink-2">{fmtTime(clock)}</span>
+        <TileClock />
       </div>
 
       {/* Acciones */}

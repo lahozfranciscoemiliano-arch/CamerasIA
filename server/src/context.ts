@@ -11,6 +11,8 @@ import type { VpnManager } from "./vpn/manager.js";
 import type { HealthService } from "./health/service.js";
 import type { AiService } from "./ai/service.js";
 import type { DetectionEngine } from "./detection/engine.js";
+import type { LiveHub } from "./live/hub.js";
+import type { LiveProfiles } from "./exacq/live-probe.js";
 
 export interface AppCtx {
   cfg: AppConfig;
@@ -26,5 +28,8 @@ export interface AppCtx {
   health: HealthService;
   ai: AiService;
   detection: DetectionEngine;
+  /** Video en vivo compartido (null si LIVE_ENABLED=false). */
+  live: LiveHub | null;
+  liveProfiles: LiveProfiles;
   log: (msg: string) => void;
 }
