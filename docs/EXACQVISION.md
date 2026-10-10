@@ -36,7 +36,19 @@ CamerasIA lo hace solo: si la URL de imagen en uso deja de devolver imágenes (4
 
 Variables disponibles en las plantillas: `{session}`, `{camera}`, `{quality}`, `{ts}`. Por seguridad sólo se aceptan rutas que empiecen con `/` (el host siempre es el del servidor configurado).
 
-Sin plantilla de stream, el video se arma pidiendo imágenes sucesivas (1-4 cuadros/s según la grilla), lo que funciona con cualquier versión y evita saturar las conexiones del navegador.
+Sin plantilla de stream, el video se arma pidiendo imágenes sucesivas, lo que funciona con cualquier versión.
+
+## Video en vivo fluido
+
+El video en vivo llega al navegador por un WebSocket dedicado (`/api/live`) con un único lazo de pedidos por cámara en el servidor, compartido por todos los visores y por el motor de detección:
+
+- **Pedidos en paralelo por cámara** (2 en la grilla, 3 en la vista ampliada) para no quedar limitado a 1 cuadro por RTT; nunca se muestra un cuadro más viejo que el anterior.
+- **Sólo el último cuadro**: el navegador confirma cada cuadro pintado; si no da abasto (o la red), se descartan los intermedios en lugar de acumular demora.
+- **Protección del exacqVision y del túnel VPN**: tope de pedidos simultáneos, de pedidos por segundo y de Mbit/s por servidor (`LIVE_*`); si se superan, la grilla baja sus cuadros por segundo y la vista ampliada no se toca.
+- Sólo se pide video de las cámaras visibles en pantalla y con la pestaña activa; la grilla se pausa mientras está abierta la vista ampliada.
+- Si el WebSocket está bloqueado (proxy), las vistas siguen por HTTP (`/api/cameras/:id/snapshot?w=`) sobre el mismo lazo.
+
+**Tamaño y calidad de imagen.** Una grilla de 16 cámaras a resolución completa satura el túnel. CamerasIA prueba una vez, automáticamente, qué parámetros de tamaño (`w`/`h`, `width`/`height`, …) y de calidad acepta `/v1/video.web`, y los verifica leyendo la cabecera JPEG de la respuesta (nunca los da por buenos sin comprobarlo). El resultado y las estadísticas en vivo se ven en *Conectividad → Video en vivo*; un Administrador puede repetir la prueba con **Optimizar video en vivo** (Tester la ejecuta sin guardar). Si el servidor no acepta ningún parámetro, el video sigue a resolución nativa y el gobernador de ancho de banda reparte los cuadros por segundo.
 
 ## Usuario recomendado en exacqVision
 

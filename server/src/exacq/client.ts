@@ -1,7 +1,9 @@
 import fs from "node:fs";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import type { CameraInfo, Clip, LiveStream, Snapshot, SourceStatus, VideoSource } from "./types.js";
+import { parseJpegInfo } from "../video/jpeg.js";
+import { fillExtra, type LiveProfile } from "./live-profile.js";
+import type { CameraInfo, Clip, LiveStream, Snapshot, SnapshotOpts, SourceStatus, VideoSource } from "./types.js";
 
 const TIMEOUT_MS = 8000;
 
@@ -86,7 +88,25 @@ export interface ExacqServerConfig {
   snapshotTemplate?: string | null;
   liveTemplate?: string | null;
   timezone?: string | null;
+  /** Perfil de video en vivo (parámetros de tamaño/calidad verificados para este servidor). */
+  liveProfile?: LiveProfile | null;
 }
+
+/** Opciones internas de un pedido de imagen. */
+interface ImageRequest {
+  quality?: number;
+  /** Parámetros extra (con marcadores {w} {h} {q} {c}) que se agregan a la URL. */
+  extra?: string;
+  w?: number;
+  h?: number;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  /** Cuadro en vivo: sus fallas no cambian el estado del servidor. */
+  live?: boolean;
+}
+
+/** Fallas seguidas de cuadros en vivo (todas las cámaras) a partir de las cuales se informa error del servidor. */
+const LIVE_FAILURES_TO_MARK = 10;
 
 export interface ExacqHooks {
   /**
@@ -99,7 +119,7 @@ export interface ExacqHooks {
 export class ExacqError extends Error {
   constructor(
     message: string,
-    public kind: "network" | "auth" | "protocol" | "not_found" = "protocol",
+    public kind: "network" | "auth" | "protocol" | "not_found" | "aborted" = "protocol",
     /** Código HTTP de la respuesta que originó el error, si la hubo. */
     public status?: number,
   ) {
@@ -240,6 +260,8 @@ export class ExacqSource implements VideoSource {
   private healing: Promise<string | null> | null = null;
   /** Último intento de autocorrección por cámara (una cámara sin video no bloquea a las demás). */
   private healAttempts = new Map<string, number>();
+  /** Cuadros en vivo fallidos seguidos (se reinicia con el primer cuadro correcto). */
+  private liveFailures = 0;
 
   constructor(
     private cfg: ExacqServerConfig,
@@ -282,12 +304,20 @@ export class ExacqSource implements VideoSource {
     if (changed) this.onStatus?.(this.status());
   }
 
-  private async fetchRaw(url: string, init: RequestInit = {}, timeout = TIMEOUT_MS) {
+  /**
+   * fetch con tiempo máximo. Si el llamador pasa su propia señal, se combina con el tiempo máximo
+   * (`timeout = null` deja sólo la señal: streams MJPEG de larga duración).
+   * `live`: los cuadros en vivo no cambian el estado del servidor al fallar.
+   */
+  private async fetchRaw(url: string, init: RequestInit = {}, timeout: number | null = TIMEOUT_MS, opts: { live?: boolean } = {}) {
+    const caller = init.signal ?? undefined;
+    const signal = timeout === null ? caller : caller ? AbortSignal.any([caller, AbortSignal.timeout(timeout)]) : AbortSignal.timeout(timeout);
     try {
-      return await fetch(url, { ...init, signal: init.signal ?? AbortSignal.timeout(timeout), redirect: "manual" });
+      return await fetch(url, { ...init, signal, redirect: "manual" });
     } catch (err) {
-      const e = new ExacqError(`No se pudo contactar ${this.cfg.baseUrl}: ${describeNetworkError(err, this.cfg.baseUrl, timeout)}`, "network");
-      this.markError(e);
+      if (caller?.aborted) throw new ExacqError("Pedido cancelado", "aborted");
+      const e = new ExacqError(`No se pudo contactar ${this.cfg.baseUrl}: ${describeNetworkError(err, this.cfg.baseUrl, timeout ?? TIMEOUT_MS)}`, "network");
+      if (!opts.live) this.markError(e);
       throw e;
     }
   }
@@ -418,16 +448,56 @@ export class ExacqSource implements VideoSource {
    * las candidatas conocidas y adopta y guarda la primera que funcione. Nunca reemplaza una
    * plantilla personalizada por el administrador ni reacciona a errores transitorios (5xx, red).
    */
-  async snapshot(cameraId: string, opts: { quality?: number } = {}): Promise<Snapshot> {
+  async snapshot(cameraId: string, opts: SnapshotOpts = {}): Promise<Snapshot> {
     const template = this.activeSnapshotTemplate();
+    const req = this.imageRequest(opts);
     try {
-      return await this.snapshotWith(template, cameraId, opts.quality);
+      return await this.snapshotWith(template, cameraId, req);
     } catch (e) {
       if (!isTemplateMismatch(e)) throw e;
       const healed = await this.healSnapshotTemplate(cameraId, template);
       if (!healed) throw e;
-      return this.snapshotWith(healed, cameraId, opts.quality);
+      return this.snapshotWith(healed, cameraId, req);
     }
+  }
+
+  /** Perfil de video en vivo vigente (null: cuadros a resolución nativa). */
+  get liveProfile(): LiveProfile | null {
+    return this.cfg.liveProfile ?? null;
+  }
+
+  setLiveProfile(p: LiveProfile | null) {
+    this.cfg.liveProfile = p;
+  }
+
+  /** Traduce las opciones de un cuadro a parámetros de URL según el perfil de video en vivo. */
+  private imageRequest(opts: SnapshotOpts): ImageRequest {
+    const req: ImageRequest = { quality: opts.quality, signal: opts.signal, timeoutMs: opts.timeoutMs, live: opts.live };
+    const p = opts.live ? this.cfg.liveProfile : null;
+    if (p) {
+      const extras: string[] = [];
+      if (opts.width && p.resize) {
+        extras.push(p.resize.extra);
+        req.w = opts.width;
+        req.h = opts.height;
+      }
+      if (opts.quality && p.quality) extras.push(p.quality.extra);
+      if (extras.length) req.extra = extras.join("&");
+    }
+    return req;
+  }
+
+  /**
+   * Cuadro con la plantilla activa y parámetros extra, sin autocorrección de plantilla ni cambio de
+   * estado del servidor (lo usa la prueba de perfil de video en vivo).
+   */
+  async fetchImage(cameraId: string, opts: { extra?: string; w?: number; h?: number; quality?: number; timeoutMs?: number; signal?: AbortSignal } = {}): Promise<Snapshot> {
+    return this.snapshotWith(this.activeSnapshotTemplate(), cameraId, { ...opts, live: true });
+  }
+
+  /** ¿La plantilla activa ya acepta la calidad ({quality})? */
+  get templateHasQuality() {
+    return this.activeSnapshotTemplate().includes("{quality}");
   }
 
   /** Sólo se autocorrigen la plantilla por defecto o una adoptada de la lista conocida. */
@@ -474,15 +544,40 @@ export class ExacqSource implements VideoSource {
     return this.healing;
   }
 
-  private async snapshotWith(template: string, cameraId: string, quality?: number): Promise<Snapshot> {
+  private async snapshotWith(template: string, cameraId: string, req: ImageRequest = {}): Promise<Snapshot> {
+    try {
+      const snap = await this.snapshotOnce(template, cameraId, req);
+      if (req.live) this.liveFailures = 0;
+      return snap;
+    } catch (e) {
+      // Los cuadros en vivo son muchos: sólo una racha larga de fallas indica un problema del servidor.
+      if (req.live && !(e instanceof ExacqError && e.kind === "aborted") && ++this.liveFailures >= LIVE_FAILURES_TO_MARK) {
+        this.liveFailures = 0;
+        this.markError(e);
+      }
+      throw e;
+    }
+  }
+
+  private async snapshotOnce(template: string, cameraId: string, req: ImageRequest): Promise<Snapshot> {
     for (let attempt = 0; attempt < 2; attempt++) {
       const s = await this.sessionId();
-      const res = await this.fetchRaw(this.url(this.fill(template, s, cameraId, quality)));
+      let url = this.fill(template, s, cameraId, req.quality);
+      if (req.extra) url += (url.includes("?") ? "&" : "?") + fillExtra(req.extra, { w: req.w, h: req.h, q: req.quality });
+      const res = await this.fetchRaw(this.url(url), { signal: req.signal }, req.timeoutMs ?? TIMEOUT_MS, { live: req.live });
       const ct = res.headers.get("content-type") ?? "";
       if (res.ok && ct.startsWith("image/")) {
-        return { data: Buffer.from(await res.arrayBuffer()), contentType: ct.split(";")[0]!, ts: Date.now() };
+        let data: Buffer;
+        try {
+          data = Buffer.from(await res.arrayBuffer());
+        } catch (err) {
+          if (req.signal?.aborted) throw new ExacqError("Pedido cancelado", "aborted");
+          throw new ExacqError(`Imagen incompleta: ${describeNetworkError(err, this.cfg.baseUrl, req.timeoutMs ?? TIMEOUT_MS)}`, "network");
+        }
+        const info = req.live ? parseJpegInfo(data) : null;
+        return { data, contentType: ct.split(";")[0]!, ts: Date.now(), ...(info ? { width: info.width, height: info.height } : {}) };
       }
-      await res.body?.cancel();
+      await res.body?.cancel().catch(() => undefined);
       if (attempt === 0 && (res.status === 401 || res.status === 403 || ct.includes("json") || ct.includes("html"))) {
         this.session = null;
         continue;
@@ -499,7 +594,7 @@ export class ExacqSource implements VideoSource {
   private async liveWith(template: string, cameraId: string): Promise<(LiveStream & { body: Readable }) | null> {
     const s = await this.sessionId();
     const ac = new AbortController();
-    const res = await this.fetchRaw(this.url(this.fill(template, s, cameraId)), { signal: ac.signal });
+    const res = await this.fetchRaw(this.url(this.fill(template, s, cameraId)), { signal: ac.signal }, null);
     const ct = res.headers.get("content-type") ?? "";
     if (!res.ok || !ct.startsWith("multipart/") || !res.body) {
       ac.abort();

@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import type { WebSocket } from "ws";
 import type { AppCtx } from "../context.js";
-import { sessionCookieName } from "../http/guards.js";
+import { isAllowedOrigin, sessionCookieName } from "../http/guards.js";
 import type { RealtimeMessage } from "./bus.js";
 
 const VPN_LOG_ROLES = new Set(["admin", "operator", "tester"]);
@@ -28,9 +28,8 @@ export function registerRealtime(app: FastifyInstance, ctx: AppCtx) {
   }, 60_000).unref();
 
   app.get("/api/ws", { websocket: true }, (socket, req) => {
-    const origin = req.headers.origin;
-    const host = req.headers.host;
-    if (origin && host && new URL(origin).host !== host && !ctx.cfg.allowedOrigins.includes(origin)) {
+    // Origin "null" o inválido ya no lanza una excepción: se rechaza.
+    if (!isAllowedOrigin(req, ctx.cfg)) {
       socket.close(4403, "origin");
       return;
     }

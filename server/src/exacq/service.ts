@@ -5,10 +5,13 @@ import type { FastifyReply, FastifyRequest } from "fastify";
 import type { Db } from "../db/index.js";
 import type { Bus } from "../realtime/bus.js";
 import type { VaultService } from "../vault/service.js";
+import type { LiveHub } from "../live/hub.js";
+import { pipeLatestMultipart } from "../live/mjpeg.js";
 import { AvailabilityTracker, type AvailabilityRules } from "./availability.js";
 import { ExacqSource } from "./client.js";
 import { DemoSource } from "./demo.js";
-import type { CameraInfo, Snapshot, SourceStatus, VideoSource } from "./types.js";
+import { liveProfileKey, parseLiveProfile, type LiveProfile } from "./live-profile.js";
+import type { CameraInfo, Snapshot, SnapshotOpts, SourceStatus, VideoSource } from "./types.js";
 
 export interface CameraRow {
   id: string;
@@ -103,6 +106,10 @@ export class CameraService {
   private tracker: AvailabilityTracker;
   private now: () => number;
   private syncing?: Promise<void>;
+  /** LiveHub (video en vivo compartido); null si LIVE_ENABLED=false o en pruebas sin hub. */
+  live: LiveHub | null = null;
+  /** Caché de perfiles de video en vivo por servidor (tabla settings, clave live_profile:<id>). */
+  private liveProfiles = new Map<string, LiveProfile | null>();
 
   constructor(
     private db: Db,
@@ -167,6 +174,7 @@ export class CameraService {
           snapshotTemplate: srv.snapshot_template,
           liveTemplate: srv.live_template,
           timezone: srv.timezone,
+          liveProfile: this.liveProfile(srv.id),
         },
         () => {
           if (!srv.credential_id) return undefined;
@@ -191,6 +199,9 @@ export class CameraService {
             );
             this.opts.log(`exacqVision ${srv.name}: plantilla de video adoptada (${reason}) ${JSON.stringify(t)}`);
             this.opts.onTemplatesAdopted?.({ id: srv.id, name: srv.name }, t, reason);
+            // Los parámetros de video en vivo se verificaron con la URL anterior: se vuelven a probar
+            // (salvo un perfil cargado a mano por un administrador).
+            if (t.snapshot && this.liveProfile(srv.id)?.source !== "manual") this.setLiveProfile(srv.id, null);
           },
         },
       );
@@ -374,8 +385,39 @@ export class CameraService {
     return { row, source };
   }
 
-  /** Snapshot con caché corta compartida entre visores y el motor de detección. */
-  async snapshot(key: string, maxAgeMs = 400): Promise<Snapshot> {
+  /** Perfil de video en vivo guardado para un servidor (null: sin probar). */
+  liveProfile(serverId: string): LiveProfile | null {
+    if (!this.liveProfiles.has(serverId)) {
+      this.liveProfiles.set(serverId, parseLiveProfile(this.db.getSetting<unknown>(liveProfileKey(serverId), null)));
+    }
+    return this.liveProfiles.get(serverId) ?? null;
+  }
+
+  /** Guarda (o borra con null) el perfil de video en vivo y lo aplica a la fuente activa. */
+  setLiveProfile(serverId: string, profile: LiveProfile | null) {
+    if (profile) this.db.setSetting(liveProfileKey(serverId), profile);
+    else this.db.run("DELETE FROM settings WHERE key = $key", { key: liveProfileKey(serverId) });
+    this.liveProfiles.set(serverId, profile);
+    const src = this.sources.get(serverId);
+    if (src instanceof ExacqSource) src.setLiveProfile(profile);
+  }
+
+  /** Cuadro en vivo para el LiveHub: tamaño/calidad según el perfil del servidor, cancelable. */
+  async liveFrame(key: string, opts: Omit<SnapshotOpts, "live"> = {}): Promise<Snapshot> {
+    const { row, source } = this.resolve(key);
+    return source.snapshot(row.camera_id, { ...opts, live: true });
+  }
+
+  /**
+   * Snapshot con caché corta compartida entre visores y el motor de detección. Si el LiveHub tiene
+   * un cuadro reciente de la cámara se usa ese (con `allowScaled` aunque sea reducido; si no, sólo
+   * si es de resolución nativa: descargas y análisis IA conservan la resolución completa).
+   */
+  async snapshot(key: string, maxAgeMs = 400, opts: { allowScaled?: boolean } = {}): Promise<Snapshot> {
+    const f = this.live?.peek(key);
+    if (f && Date.now() - f.tCap <= maxAgeMs && (opts.allowScaled || f.native)) {
+      return { data: f.data, contentType: "image/jpeg", ts: f.tCap, width: f.w, height: f.h };
+    }
     const ts = this.snapTs.get(key) ?? 0;
     const cached = this.snapCache.get(key);
     if (cached && Date.now() - ts < maxAgeMs) return cached;
@@ -389,8 +431,12 @@ export class CameraService {
     return p;
   }
 
-  /** Stream MJPEG: usa el stream nativo del servidor si está configurado; si no, lo sintetiza desde snapshots. */
-  async stream(key: string, req: FastifyRequest, reply: FastifyReply, fps: number) {
+  /**
+   * Stream MJPEG: usa el stream nativo del servidor si está configurado; si no, lo sintetiza con el
+   * LiveHub (o con snapshots si no hay hub). Siempre con contrapresión: si el cliente no consume,
+   * se conserva sólo el último cuadro (la demora no crece mientras la vista siga abierta).
+   */
+  async stream(key: string, req: FastifyRequest, reply: FastifyReply, fps: number, opts: { tierW?: number } = {}) {
     const { row, source } = this.resolve(key);
     let closed = false;
     reply.raw.on("close", () => {
@@ -404,11 +450,23 @@ export class CameraService {
       try {
         for await (const chunk of native.body) {
           if (closed) break;
-          reply.raw.write(chunk);
+          if (!reply.raw.write(chunk)) {
+            // Contrapresión: se espera a que el cliente consuma (o se desconecte).
+            await new Promise<void>((resolve) => {
+              const done = () => {
+                reply.raw.off("drain", done);
+                reply.raw.off("close", done);
+                resolve();
+              };
+              reply.raw.on("drain", done);
+              reply.raw.on("close", done);
+            });
+          }
         }
       } catch {
         /* cliente desconectado */
       }
+      native.abort();
       reply.raw.end();
       return;
     }
@@ -420,22 +478,49 @@ export class CameraService {
       "X-Accel-Buffering": "no",
       Connection: "close",
     });
-    const interval = 1000 / Math.min(Math.max(fps, 0.2), 10);
+    const out = pipeLatestMultipart(reply.raw, boundary);
+    const rate = Math.min(Math.max(fps, 0.2), 10);
+    if (this.live) {
+      let stalls = 0;
+      const sub = this.live.subscribe(
+        key,
+        { fps: rate, tierW: opts.tierW ?? 0, prio: "focus" },
+        {
+          onFrame: (f) => {
+            stalls = 0;
+            out.push(f.data, "image/jpeg");
+          },
+          onState: (st) => {
+            // Cámara inexistente/deshabilitada o sin cuadros por mucho tiempo: se corta el stream.
+            if (st.st === "error" || st.st === "disabled" || (st.st === "stalled" && ++stalls > 5)) reply.raw.end();
+          },
+        },
+      );
+      await new Promise<void>((resolve) => {
+        if (closed || reply.raw.writableEnded) return resolve();
+        reply.raw.once("close", () => resolve());
+        reply.raw.once("finish", () => resolve());
+      });
+      sub.close();
+      out.close();
+      if (!reply.raw.writableEnded) reply.raw.end();
+      return;
+    }
+    const interval = 1000 / rate;
     let failures = 0;
     while (!closed) {
       const t0 = Date.now();
       try {
         const snap = await this.snapshot(key, interval * 0.8);
         failures = 0;
-        reply.raw.write(`--${boundary}\r\nContent-Type: ${snap.contentType}\r\nContent-Length: ${snap.data.length}\r\n\r\n`);
-        reply.raw.write(snap.data);
-        reply.raw.write("\r\n");
+        out.push(snap.data, snap.contentType);
       } catch {
         failures++;
         if (failures > 10) break;
       }
       await sleep(Math.max(50, interval - (Date.now() - t0)) * (failures ? 2 : 1));
     }
+    out.close();
     reply.raw.end();
   }
 

@@ -61,6 +61,24 @@ const EnvSchema = z.object({
   // Ingesta de detecciones externas (Frigate, CodeProject.AI, scripts propios)
   INGEST_ENABLED: bool(true),
 
+  // Video en vivo de baja latencia (LiveHub + WebSocket /api/live)
+  LIVE_ENABLED: bool(true),
+  LIVE_GRID_MAX_FPS: int(4),
+  LIVE_FOCUS_MAX_FPS: int(12),
+  LIVE_PIPELINE_GRID: int(2),
+  LIVE_PIPELINE_FOCUS: int(3),
+  LIVE_FRAME_TIMEOUT_MS: int(4000),
+  LIVE_IDLE_GRACE_MS: int(5000),
+  LIVE_LATEST_TTL_MS: int(10_000),
+  LIVE_MAX_CONCURRENT_PER_SERVER: int(12),
+  LIVE_MAX_UPSTREAM_FPS_PER_SERVER: int(40),
+  LIVE_MAX_UPSTREAM_MBPS: int(40),
+  LIVE_MAX_CONN_PER_USER: int(4),
+  LIVE_MAX_SUBS_PER_CONN: int(25),
+  LIVE_MAX_FOCUS_PER_USER: int(2),
+  LIVE_WS_HIGH_WATER_BYTES: int(1024 * 1024),
+  LIVE_REVALIDATE_MS: int(30_000),
+
   LOG_LEVEL: z.string().default("info"),
 });
 

@@ -2,6 +2,7 @@ import type { Db } from "../db/index.js";
 import type { CameraRow, CameraService } from "../exacq/service.js";
 import type { EventService, EventType, Severity } from "../events/service.js";
 import type { AiService, VisionResult } from "../ai/service.js";
+import type { LiveHub } from "../live/hub.js";
 import { compareGrids, lumaGrid } from "./motion.js";
 
 const THREAT_TO_SEVERITY: Record<VisionResult["threat_level"], Severity> = {
@@ -62,7 +63,15 @@ export class DetectionEngine {
     private cameras: CameraService,
     private events: EventService,
     private ai: AiService,
-    private opts: { intervalMs: number; cooldownMs: number; log: (m: string) => void; rules?: () => DetectionRules; now?: () => number },
+    private opts: {
+      intervalMs: number;
+      cooldownMs: number;
+      log: (m: string) => void;
+      rules?: () => DetectionRules;
+      now?: () => number;
+      /** Si está, el movimiento se analiza con cuadros de 640 px del LiveHub (compartidos con los visores). */
+      live?: LiveHub | null;
+    },
   ) {
     this.now = opts.now ?? Date.now;
   }
@@ -134,8 +143,12 @@ export class DetectionEngine {
   private async process(cam: CameraRow) {
     this.busy.add(cam.id);
     try {
-      const snap = await this.cameras.snapshot(cam.id, this.opts.intervalMs * 0.75);
-      const grid = lumaGrid(snap.data);
+      // Movimiento: cuadro reducido (640 px) del hub; decodificarlo cuesta ~5 veces menos que uno de
+      // resolución completa y comparte el pedido con quien esté mirando la cámara.
+      const frame = this.opts.live
+        ? (await this.opts.live.pull(cam.id, { tierW: 640, fps: 0.5, maxAgeMs: 1500, timeoutMs: 4000 })).data
+        : (await this.cameras.snapshot(cam.id, this.opts.intervalMs * 0.75)).data;
+      const grid = lumaGrid(frame);
       this.stats.framesAnalyzed++;
       const prev = this.prev.get(cam.id);
       this.prev.set(cam.id, grid);
@@ -150,8 +163,8 @@ export class DetectionEngine {
         const n = (streak?.n ?? 0) + 1;
         if (n >= rules.tamperConfirmFrames) {
           this.tamperStreak.delete(cam.id);
-          this.pendingTamper.push({ cam, ts: now, snapshot: streak?.snapshot ?? snap.data });
-        } else this.tamperStreak.set(cam.id, { n, snapshot: streak?.snapshot ?? snap.data });
+          this.pendingTamper.push({ cam, ts: now, snapshot: await this.evidence(cam.id, streak?.snapshot ?? frame) });
+        } else this.tamperStreak.set(cam.id, { n, snapshot: streak?.snapshot ?? frame });
         return;
       }
       if (streak) this.tamperStreak.delete(cam.id);
@@ -168,6 +181,7 @@ export class DetectionEngine {
       this.lastEvent.set(cam.id, now);
       this.pendingMotion.delete(cam.id);
       this.stats.motionEvents++;
+      const evidence = await this.evidence(cam.id, frame);
 
       const { ev, created } = this.events.upsert({
         type: "motion",
@@ -176,7 +190,7 @@ export class DetectionEngine {
         cameraId: cam.id,
         title: `Movimiento detectado en ${cam.name}`,
         description: `Cambio en ${(r.changedFraction * 100).toFixed(1)}% de la imagen.`,
-        snapshot: snap.data,
+        snapshot: evidence,
         meta: { changedFraction: r.changedFraction, box: r.box },
         dedupeKey: `motion:${cam.id}`,
         dedupeWindowMs: rules.motionDedupeMin * 60_000,
@@ -185,17 +199,27 @@ export class DetectionEngine {
       if (!cam.ai_verify || !this.ai.available() || !this.ai.settings().autoVerify || this.cameras.isMuted(cam.id)) return;
       if (created) {
         this.lastVerify.set(ev.id, now);
-        void this.verify(ev.id, cam, snap.data);
+        void this.verify(ev.id, cam, evidence);
       } else if (now - (this.lastVerify.get(ev.id) ?? 0) >= rules.aiReverifyMin * 60_000) {
         // Movimiento repetido: se re-verifica cada tanto con el cuadro nuevo, sin bajar nunca la severidad.
         this.lastVerify.set(ev.id, now);
-        void this.verify(ev.id, cam, snap.data, undefined, { keepMax: true });
+        void this.verify(ev.id, cam, evidence, undefined, { keepMax: true });
       }
     } catch (e) {
       this.stats.errors++;
       if (this.ticks % 30 === 0) this.opts.log(`detección ${cam.name}: ${(e as Error).message}`);
     } finally {
       this.busy.delete(cam.id);
+    }
+  }
+
+  /** Imagen de evidencia a resolución completa (para el evento y la IA); si falla, el cuadro analizado. */
+  private async evidence(key: string, fallback: Buffer): Promise<Buffer> {
+    if (!this.opts.live) return fallback;
+    try {
+      return (await this.cameras.snapshot(key, 1500)).data;
+    } catch {
+      return fallback;
     }
   }
 
